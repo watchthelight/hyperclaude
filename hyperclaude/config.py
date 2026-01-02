@@ -37,12 +37,169 @@ def ensure_directories() -> dict[str, Path]:
         "state_workers": base / "state" / "workers",
         "protocols": base / "protocols",
         "triggers": base / "triggers",
+        "sessions": base / "sessions",
     }
 
     for path in dirs.values():
         path.mkdir(parents=True, exist_ok=True)
 
     return dirs
+
+
+# =============================================================================
+# Multi-Session Management
+# =============================================================================
+
+def get_sessions_dir() -> Path:
+    """Get the sessions directory."""
+    return get_hyperclaude_dir() / "sessions"
+
+
+def get_session_dir(name: str) -> Path:
+    """Get the directory for a specific session."""
+    return get_sessions_dir() / name
+
+
+def ensure_session_directories(name: str) -> dict[str, Path]:
+    """Create all directories for a session. Returns dict of paths."""
+    session_dir = get_session_dir(name)
+
+    dirs = {
+        "base": session_dir,
+        "state": session_dir / "state",
+        "state_workers": session_dir / "state" / "workers",
+        "triggers": session_dir / "triggers",
+        "results": session_dir / "results",
+        "locks": session_dir / "locks",
+    }
+
+    for path in dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
+
+    return dirs
+
+
+def register_session(name: str, workspace: Path, num_workers: int) -> None:
+    """Register a new session with its metadata."""
+    ensure_session_directories(name)
+    session_dir = get_session_dir(name)
+
+    metadata = {
+        "name": name,
+        "workspace": str(workspace),
+        "num_workers": num_workers,
+        "tmux_session": name,  # tmux session name = hyperclaude session name
+        "tmux_window": "main",
+    }
+
+    (session_dir / "session.json").write_text(json.dumps(metadata, indent=2))
+
+    # Set as active session
+    set_active_session(name)
+
+
+def unregister_session(name: str) -> None:
+    """Remove a session registration."""
+    import shutil
+    session_dir = get_session_dir(name)
+    if session_dir.exists():
+        shutil.rmtree(session_dir)
+
+    # If this was the active session, clear it
+    active = get_active_session()
+    if active == name:
+        active_file = get_hyperclaude_dir() / "active_session"
+        if active_file.exists():
+            active_file.unlink()
+
+
+def list_sessions() -> list[dict[str, Any]]:
+    """List all registered sessions with their metadata."""
+    sessions_dir = get_sessions_dir()
+    if not sessions_dir.exists():
+        return []
+
+    sessions = []
+    for session_dir in sessions_dir.iterdir():
+        if session_dir.is_dir():
+            metadata_file = session_dir / "session.json"
+            if metadata_file.exists():
+                try:
+                    metadata = json.loads(metadata_file.read_text())
+                    sessions.append(metadata)
+                except json.JSONDecodeError:
+                    pass
+    return sessions
+
+
+def get_session_info(name: str) -> dict[str, Any] | None:
+    """Get metadata for a specific session."""
+    metadata_file = get_session_dir(name) / "session.json"
+    if metadata_file.exists():
+        try:
+            return json.loads(metadata_file.read_text())
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def get_active_session() -> str | None:
+    """Get the currently active session name."""
+    active_file = get_hyperclaude_dir() / "active_session"
+    if active_file.exists():
+        name = active_file.read_text().strip()
+        # Verify session exists
+        if get_session_info(name):
+            return name
+    return None
+
+
+def set_active_session(name: str) -> None:
+    """Set the active session."""
+    ensure_directories()
+    active_file = get_hyperclaude_dir() / "active_session"
+    active_file.write_text(name)
+
+
+def get_default_session_name() -> str:
+    """Get or generate a default session name."""
+    # If there's an active session, use it
+    active = get_active_session()
+    if active:
+        return active
+    # Default to "swarm" for backwards compatibility
+    return "swarm"
+
+
+# Session-aware path helpers
+def get_session_state_dir(session: str | None = None) -> Path:
+    """Get state directory for a session."""
+    session = session or get_active_session() or "swarm"
+    return get_session_dir(session) / "state"
+
+
+def get_session_triggers_dir(session: str | None = None) -> Path:
+    """Get triggers directory for a session."""
+    session = session or get_active_session() or "swarm"
+    return get_session_dir(session) / "triggers"
+
+
+def get_session_results_dir(session: str | None = None) -> Path:
+    """Get results directory for a session."""
+    session = session or get_active_session() or "swarm"
+    return get_session_dir(session) / "results"
+
+
+def get_session_locks_dir(session: str | None = None) -> Path:
+    """Get locks directory for a session."""
+    session = session or get_active_session() or "swarm"
+    return get_session_dir(session) / "locks"
+
+
+def get_session_worker_state_dir(session: str | None = None) -> Path:
+    """Get worker state directory for a session."""
+    session = session or get_active_session() or "swarm"
+    return get_session_dir(session) / "state" / "workers"
 
 
 def get_protocols_dir() -> Path:

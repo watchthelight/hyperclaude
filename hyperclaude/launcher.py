@@ -8,7 +8,11 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .config import load_config, get_hyperclaude_dir, init_hyperclaude, configure_claude_permissions
+from .config import (
+    load_config, get_hyperclaude_dir, init_hyperclaude, configure_claude_permissions,
+    register_session, unregister_session, get_session_info, get_active_session,
+    get_default_session_name, set_active_session, list_sessions,
+)
 
 
 def get_platform() -> str:
@@ -21,15 +25,15 @@ def get_platform() -> str:
         return "unknown"
 
 
-def find_linux_terminal() -> Optional[list[str]]:
+def find_linux_terminal(session: str) -> Optional[list[str]]:
     """Find available terminal emulator on Linux."""
     terminals = [
-        ("gnome-terminal", ["gnome-terminal", "--", "tmux", "attach", "-t", "swarm"]),
-        ("konsole", ["konsole", "-e", "tmux", "attach", "-t", "swarm"]),
-        ("xfce4-terminal", ["xfce4-terminal", "-e", "tmux attach -t swarm"]),
-        ("alacritty", ["alacritty", "-e", "tmux", "attach", "-t", "swarm"]),
-        ("kitty", ["kitty", "tmux", "attach", "-t", "swarm"]),
-        ("xterm", ["xterm", "-e", "tmux", "attach", "-t", "swarm"]),
+        ("gnome-terminal", ["gnome-terminal", "--", "tmux", "attach", "-t", session]),
+        ("konsole", ["konsole", "-e", "tmux", "attach", "-t", session]),
+        ("xfce4-terminal", ["xfce4-terminal", "-e", f"tmux attach -t {session}"]),
+        ("alacritty", ["alacritty", "-e", "tmux", "attach", "-t", session]),
+        ("kitty", ["kitty", "tmux", "attach", "-t", session]),
+        ("xterm", ["xterm", "-e", f"tmux attach -t {session}"]),
     ]
     for name, cmd in terminals:
         if shutil.which(name):
@@ -56,7 +60,7 @@ def open_terminal_with_swarm(session: str) -> bool:
         return True
 
     elif platform == "linux":
-        terminal_cmd = find_linux_terminal()
+        terminal_cmd = find_linux_terminal(session)
         if terminal_cmd:
             subprocess.Popen(terminal_cmd, start_new_session=True)
             return True
@@ -91,24 +95,101 @@ def wait_for_pane_ready(pane: str, timeout: int = 30) -> bool:
     return False
 
 
-def is_swarm_running() -> bool:
-    """Check if a swarm tmux session exists."""
-    config = load_config()
-    session = config["tmux_session"]
+def is_swarm_running(session_name: Optional[str] = None) -> bool:
+    """Check if a swarm tmux session exists.
+
+    If session_name is provided, checks that specific session.
+    Otherwise, checks the active session or falls back to 'swarm'.
+    """
+    if session_name:
+        session = session_name
+    else:
+        # Check active session first
+        active = get_active_session()
+        if active:
+            session = active
+        else:
+            config = load_config()
+            session = config["tmux_session"]
 
     result = run_tmux(["has-session", "-t", session], check=False)
     return result.returncode == 0
 
 
-def get_pane_target(worker_id: int) -> str:
-    """Get the tmux pane target for a worker."""
+def is_any_swarm_running() -> bool:
+    """Check if any registered hyperclaude session is running."""
+    sessions = list_sessions()
+    for sess_info in sessions:
+        name = sess_info.get("name")
+        if name and is_swarm_running(name):
+            return True
+    return False
+
+
+def get_pane_target(worker_id: int, session_name: Optional[str] = None) -> str:
+    """Get the tmux pane target for a worker.
+
+    If session_name is provided, uses that session.
+    Otherwise uses the active session or falls back to config default.
+    """
+    if session_name:
+        session_info = get_session_info(session_name)
+        if session_info:
+            return f"{session_info['tmux_session']}:{session_info['tmux_window']}.{worker_id}"
+
+    # Fall back to active session
+    active = get_active_session()
+    if active:
+        session_info = get_session_info(active)
+        if session_info:
+            return f"{session_info['tmux_session']}:{session_info['tmux_window']}.{worker_id}"
+
+    # Fall back to config defaults
     config = load_config()
     return f"{config['tmux_session']}:{config['tmux_window']}.{worker_id}"
 
 
-def send_to_worker(worker_id: int, message: str) -> None:
+def get_manager_pane_target(session_name: Optional[str] = None) -> str:
+    """Get the tmux pane target for the manager.
+
+    Manager is always the last pane (pane N where N = num_workers).
+    """
+    if session_name:
+        session_info = get_session_info(session_name)
+        if session_info:
+            num_workers = session_info.get("num_workers", 6)
+            return f"{session_info['tmux_session']}:{session_info['tmux_window']}.{num_workers}"
+
+    # Fall back to active session
+    active = get_active_session()
+    if active:
+        session_info = get_session_info(active)
+        if session_info:
+            num_workers = session_info.get("num_workers", 6)
+            return f"{session_info['tmux_session']}:{session_info['tmux_window']}.{num_workers}"
+
+    # Fall back to config defaults
+    config = load_config()
+    return f"{config['tmux_session']}:{config['tmux_window']}.{config['default_workers']}"
+
+
+def send_to_worker(worker_id: int, message: str, session_name: Optional[str] = None) -> None:
     """Send a message to a worker pane."""
-    target = get_pane_target(worker_id)
+    target = get_pane_target(worker_id, session_name)
+    # Send text - for multi-line, Claude CLI enters "paste mode"
+    run_tmux(["send-keys", "-t", target, message])
+    # Small delay to let paste mode complete
+    time.sleep(0.2)
+    # Escape ensures we exit any special input mode
+    run_tmux(["send-keys", "-t", target, "Escape"])
+    time.sleep(0.1)
+    # Send Enter to submit the message
+    run_tmux(["send-keys", "-t", target, "Enter"])
+
+
+def send_to_manager(message: str, session_name: Optional[str] = None) -> None:
+    """Send a message to the manager pane."""
+    target = get_manager_pane_target(session_name)
     # Send text - for multi-line, Claude CLI enters "paste mode"
     run_tmux(["send-keys", "-t", target, message])
     # Small delay to let paste mode complete
@@ -315,13 +396,22 @@ def start_swarm(
     num_workers: int,
     model: str,
     continue_session: bool = False,
+    session_name: Optional[str] = None,
 ) -> None:
-    """Start the hyperclaude swarm."""
+    """Start the hyperclaude swarm.
+
+    Args:
+        workspace: Directory where the swarm operates
+        num_workers: Number of worker instances
+        model: Model to use for Claude instances
+        continue_session: Whether to continue manager's previous conversation
+        session_name: Name for this session (default: 'swarm')
+    """
     from .protocols import install_default_protocols, reset_swarm_state
 
-    config = load_config()
-    session = config["tmux_session"]
-    window = config["tmux_window"]
+    # Determine session name
+    session = session_name or get_default_session_name()
+    window = "main"
 
     # Initialize directories and install default protocols
     init_hyperclaude()
@@ -332,7 +422,10 @@ def start_swarm(
         print("Configured Claude Code permissions for hyperclaude")
 
     # Reset swarm state for fresh start
-    reset_swarm_state()
+    reset_swarm_state(session)
+
+    # Register this session
+    register_session(session, workspace, num_workers)
 
     # Kill existing session if any
     run_tmux(["kill-session", "-t", session], check=False)
@@ -468,16 +561,28 @@ def start_swarm(
         print(f"\nAttach manually: tmux attach -t {session}")
 
 
-def stop_swarm() -> None:
-    """Stop the swarm gracefully."""
-    config = load_config()
-    session = config["tmux_session"]
+def stop_swarm(session_name: Optional[str] = None) -> None:
+    """Stop the swarm gracefully.
+
+    Args:
+        session_name: Name of session to stop (default: active session)
+    """
+    from .config import get_session_locks_dir
+
+    # Determine session
+    session = session_name or get_active_session()
+    if not session:
+        config = load_config()
+        session = config["tmux_session"]
 
     # Kill the session
     run_tmux(["kill-session", "-t", session], check=False)
 
-    # Clean up lock files
-    locks_dir = get_hyperclaude_dir() / "locks"
+    # Clean up lock files for this session
+    locks_dir = get_session_locks_dir(session)
     if locks_dir.exists():
         for lock_file in locks_dir.glob("*.lock"):
             lock_file.unlink()
+
+    # Unregister the session
+    unregister_session(session)

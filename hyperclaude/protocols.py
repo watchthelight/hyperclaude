@@ -14,6 +14,12 @@ from .config import (
     get_worker_state_dir,
     ensure_directories,
     load_config,
+    get_session_state_dir,
+    get_session_triggers_dir,
+    get_session_worker_state_dir,
+    get_active_session,
+    get_session_info,
+    ensure_session_directories,
 )
 
 
@@ -67,60 +73,62 @@ def install_default_protocols() -> None:
 
 
 # =============================================================================
-# Active Protocol and Phase
+# Active Protocol and Phase (session-aware)
 # =============================================================================
 
-def get_state_dir() -> Path:
-    """Get the state directory."""
-    return get_hyperclaude_dir() / "state"
+def get_state_dir(session: Optional[str] = None) -> Path:
+    """Get the state directory for a session."""
+    return get_session_state_dir(session)
 
 
-def set_active_protocol(name: str) -> bool:
+def set_active_protocol(name: str, session: Optional[str] = None) -> bool:
     """Set the active protocol. Returns False if protocol doesn't exist."""
     if not get_protocol_path(name).exists():
         return False
 
-    ensure_directories()
-    state_file = get_state_dir() / "protocol"
+    session = session or get_active_session() or "swarm"
+    ensure_session_directories(session)
+    state_file = get_state_dir(session) / "protocol"
     state_file.write_text(name)
     return True
 
 
-def get_active_protocol() -> Optional[str]:
+def get_active_protocol(session: Optional[str] = None) -> Optional[str]:
     """Get the currently active protocol name."""
-    state_file = get_state_dir() / "protocol"
+    state_file = get_state_dir(session) / "protocol"
     if state_file.exists():
         return state_file.read_text().strip()
     return None
 
 
-def set_phase(phase: str) -> None:
+def set_phase(phase: str, session: Optional[str] = None) -> None:
     """Set the current phase."""
-    ensure_directories()
-    state_file = get_state_dir() / "phase"
+    session = session or get_active_session() or "swarm"
+    ensure_session_directories(session)
+    state_file = get_state_dir(session) / "phase"
     state_file.write_text(phase)
 
 
-def get_phase() -> Optional[str]:
+def get_phase(session: Optional[str] = None) -> Optional[str]:
     """Get the current phase."""
-    state_file = get_state_dir() / "phase"
+    state_file = get_state_dir(session) / "phase"
     if state_file.exists():
         return state_file.read_text().strip()
     return None
 
 
 # =============================================================================
-# Worker State (JSON-based)
+# Worker State (JSON-based, session-aware)
 # =============================================================================
 
-def get_worker_state_path(worker_id: int) -> Path:
+def get_worker_state_path(worker_id: int, session: Optional[str] = None) -> Path:
     """Get the path to a worker's JSON state file."""
-    return get_worker_state_dir() / f"{worker_id}.json"
+    return get_session_worker_state_dir(session) / f"{worker_id}.json"
 
 
-def get_worker_state(worker_id: int) -> dict[str, Any]:
+def get_worker_state(worker_id: int, session: Optional[str] = None) -> dict[str, Any]:
     """Get the state of a worker as a dict."""
-    path = get_worker_state_path(worker_id)
+    path = get_worker_state_path(worker_id, session)
     if path.exists():
         try:
             return json.loads(path.read_text())
@@ -129,62 +137,70 @@ def get_worker_state(worker_id: int) -> dict[str, Any]:
     return {"status": "ready"}
 
 
-def set_worker_state(worker_id: int, **kwargs) -> None:
+def set_worker_state(worker_id: int, session: Optional[str] = None, **kwargs) -> None:
     """Set worker state. Starts fresh to avoid stale data from previous tasks."""
-    ensure_directories()
+    session = session or get_active_session() or "swarm"
+    ensure_session_directories(session)
     # Start fresh instead of merging - prevents stale branch/files from persisting
     new_state = {"status": "ready"}
     new_state.update(kwargs)
-    path = get_worker_state_path(worker_id)
+    path = get_worker_state_path(worker_id, session)
     path.write_text(json.dumps(new_state, indent=2))
 
 
-def get_all_worker_states() -> dict[int, dict[str, Any]]:
+def get_all_worker_states(session: Optional[str] = None) -> dict[int, dict[str, Any]]:
     """Get states for all workers."""
-    config = load_config()
-    num_workers = config["default_workers"]
+    session = session or get_active_session()
+    session_info = get_session_info(session) if session else None
+
+    if session_info:
+        num_workers = session_info.get("num_workers", 6)
+    else:
+        config = load_config()
+        num_workers = config["default_workers"]
 
     states = {}
     for i in range(num_workers):
-        states[i] = get_worker_state(i)
+        states[i] = get_worker_state(i, session)
     return states
 
 
-def clear_worker_states() -> None:
+def clear_worker_states(session: Optional[str] = None) -> None:
     """Clear all worker state files."""
-    state_dir = get_worker_state_dir()
+    state_dir = get_session_worker_state_dir(session)
     if state_dir.exists():
         for f in state_dir.glob("*.json"):
             f.unlink()
 
 
 # =============================================================================
-# Triggers
+# Triggers (session-aware)
 # =============================================================================
 
-def create_trigger(name: str) -> None:
+def create_trigger(name: str, session: Optional[str] = None) -> None:
     """Create a trigger file."""
-    ensure_directories()
-    trigger_file = get_triggers_dir() / name
+    session = session or get_active_session() or "swarm"
+    ensure_session_directories(session)
+    trigger_file = get_session_triggers_dir(session) / name
     trigger_file.touch()
 
 
-def trigger_exists(name: str) -> bool:
+def trigger_exists(name: str, session: Optional[str] = None) -> bool:
     """Check if a trigger file exists."""
-    trigger_file = get_triggers_dir() / name
+    trigger_file = get_session_triggers_dir(session) / name
     return trigger_file.exists()
 
 
-def clear_trigger(name: str) -> None:
+def clear_trigger(name: str, session: Optional[str] = None) -> None:
     """Remove a trigger file."""
-    trigger_file = get_triggers_dir() / name
+    trigger_file = get_session_triggers_dir(session) / name
     if trigger_file.exists():
         trigger_file.unlink()
 
 
-def await_trigger(name: str, timeout: int = 300) -> bool:
+def await_trigger(name: str, timeout: int = 300, session: Optional[str] = None) -> bool:
     """Wait for a trigger file to appear. Returns True if found, False on timeout."""
-    trigger_file = get_triggers_dir() / name
+    trigger_file = get_session_triggers_dir(session) / name
     start = time.time()
 
     while time.time() - start < timeout:
@@ -195,28 +211,34 @@ def await_trigger(name: str, timeout: int = 300) -> bool:
     return False
 
 
-def clear_all_triggers() -> None:
+def clear_all_triggers(session: Optional[str] = None) -> None:
     """Remove all trigger files."""
-    triggers_dir = get_triggers_dir()
+    triggers_dir = get_session_triggers_dir(session)
     if triggers_dir.exists():
         for f in triggers_dir.iterdir():
             if f.is_file():
                 f.unlink()
 
 
-def check_all_workers_done() -> bool:
+def check_all_workers_done(session: Optional[str] = None) -> bool:
     """Check if all workers are done and create all-done trigger if so."""
-    config = load_config()
-    num_workers = config["default_workers"]
+    session = session or get_active_session()
+    session_info = get_session_info(session) if session else None
+
+    if session_info:
+        num_workers = session_info.get("num_workers", 6)
+    else:
+        config = load_config()
+        num_workers = config["default_workers"]
 
     all_done = True
     for i in range(num_workers):
-        if not trigger_exists(f"worker-{i}-done"):
+        if not trigger_exists(f"worker-{i}-done", session):
             all_done = False
             break
 
     if all_done:
-        create_trigger("all-done")
+        create_trigger("all-done", session)
 
     return all_done
 
@@ -225,13 +247,13 @@ def check_all_workers_done() -> bool:
 # Convenience Functions
 # =============================================================================
 
-def reset_swarm_state() -> None:
+def reset_swarm_state(session: Optional[str] = None) -> None:
     """Reset all swarm state (workers, triggers, protocol, phase)."""
-    clear_worker_states()
-    clear_all_triggers()
+    clear_worker_states(session)
+    clear_all_triggers(session)
 
     # Clear protocol and phase
-    state_dir = get_state_dir()
+    state_dir = get_state_dir(session)
     for name in ["protocol", "phase"]:
         path = state_dir / name
         if path.exists():

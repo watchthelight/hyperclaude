@@ -43,9 +43,10 @@ hyperclaude creates a tmux session with:
 1. **Token-efficient protocols**: Workers read protocol docs from files, not inline prompts
 2. **Workers are stateless**: Cleared before new task batches
 3. **Manager is interactive**: Uses normal Claude permissions (no bypass)
-4. **File-based coordination**: State in `~/.hyperclaude/state/`, triggers in `~/.hyperclaude/triggers/`
+4. **File-based coordination**: Session state in `~/.hyperclaude/sessions/<name>/`
 5. **HYPERCLAUDE_WORKER_ID**: Environment variable auto-set for each worker
 6. **Auto-configured permissions**: Adds `Read(~/.hyperclaude/**)` and `Bash(hyperclaude:*)` to `~/.claude/settings.json`
+7. **Multi-session support**: Run multiple independent swarms with `--name` flag
 
 ## CLI Commands
 
@@ -55,8 +56,11 @@ hyperclaude setup               # Configure Claude Code permissions
 hyperclaude setup --check       # Check permission status
 hyperclaude                     # Start swarm in current directory
 hyperclaude --workers 4         # Start with 4 workers
+hyperclaude --name project1     # Start named session (for multiple swarms)
 hyperclaude -d /path/to/proj    # Start in specific directory
-hyperclaude stop                # Gracefully shutdown swarm
+hyperclaude sessions            # List all registered sessions
+hyperclaude stop                # Gracefully shutdown active swarm
+hyperclaude stop --name proj1   # Stop specific session
 ```
 
 ### Protocol & Phase Management
@@ -71,6 +75,7 @@ hyperclaude phase               # Show current phase
 ### Manager Commands (coordinating workers)
 ```bash
 hyperclaude send 0 "task"       # Send task to worker 0
+hyperclaude send manager "msg"  # Send message to the manager
 hyperclaude broadcast "task"    # Send task to ALL workers
 hyperclaude await all-done      # Wait for all workers (trigger-based)
 hyperclaude state               # Show worker states (JSON-based)
@@ -93,23 +98,27 @@ hyperclaude unlock                    # Release locks
 
 ```
 ~/.hyperclaude/
-├── protocols/              # Protocol documentation
+├── active_session          # Currently active session name
+├── protocols/              # Protocol documentation (shared)
 │   ├── default.md
 │   ├── git-branch.md
 │   ├── search.md
 │   └── review.md
-├── state/
-│   ├── protocol            # Active protocol name
-│   ├── phase               # Current phase
-│   └── workers/
-│       ├── 0.json          # Worker 0 state (status, branch, files, etc.)
-│       └── ...
-├── triggers/               # Event files (presence = event occurred)
-│   ├── worker-0-done
-│   ├── all-done
-│   └── ...
-├── results/                # Worker result files
-└── locks/                  # File locks
+└── sessions/               # Per-session directories
+    └── <session_name>/
+        ├── session.json    # Session metadata (workspace, num_workers)
+        ├── state/
+        │   ├── protocol    # Active protocol name
+        │   ├── phase       # Current phase
+        │   └── workers/
+        │       ├── 0.json  # Worker 0 state (status, branch, files, etc.)
+        │       └── ...
+        ├── triggers/       # Event files (presence = event occurred)
+        │   ├── worker-0-done
+        │   ├── all-done
+        │   └── ...
+        ├── results/        # Worker result files
+        └── locks/          # File locks
 ```
 
 ## Important Implementation Notes
