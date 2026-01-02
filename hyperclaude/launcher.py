@@ -18,13 +18,15 @@ def run_tmux(args: list[str], check: bool = True) -> subprocess.CompletedProcess
 def wait_for_pane_ready(pane: str, timeout: int = 30) -> bool:
     """Wait until Claude shows its input prompt (>) in the pane."""
     import re
-    for _ in range(timeout * 2):  # Check every 0.5s
-        result = run_tmux(["capture-pane", "-t", pane, "-p"], check=False)
+    for _ in range(timeout * 4):  # Check every 0.25s for faster response
+        result = run_tmux(["capture-pane", "-t", pane, "-p", "-S", "-5"], check=False)
         if result.returncode == 0:
-            # Look for Claude's prompt: a line with just ">"
-            if re.search(r'^\s*>\s*$', result.stdout, re.MULTILINE):
+            # Look for Claude's prompt: ">" at start of line, or "> " input area
+            # Also check for "tokens" which appears in the status bar when ready
+            output = result.stdout
+            if re.search(r'^\s*>\s*$', output, re.MULTILINE) or 'tokens' in output:
                 return True
-        time.sleep(0.5)
+        time.sleep(0.25)
     return False
 
 
@@ -218,6 +220,9 @@ def start_swarm(
         "-x", "200", "-y", "50",
     ])
 
+    # Enable mouse mode for scrolling (instead of up-arrow behavior)
+    run_tmux(["set-option", "-t", session, "-g", "mouse", "on"])
+
     # Start Claude in pane 0 (Enter must be separate!)
     run_tmux(["send-keys", "-t", f"{session}:{window}", "claude --dangerously-skip-permissions"])
     run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
@@ -259,17 +264,27 @@ def start_swarm(
     else:
         print("  Manager ready")
 
-    # Clear all workers to start fresh
+    # Clear all workers to start fresh (with delays to ensure delivery)
+    print("Clearing workers...")
     for i in range(num_workers):
         pane = f"{session}:{window}.{i}"
         run_tmux(["send-keys", "-t", pane, "/clear"])
+        time.sleep(0.1)
         run_tmux(["send-keys", "-t", pane, "Enter"])
+        time.sleep(0.2)  # Small delay between workers
 
     # Wait for workers to clear
-    time.sleep(1)
+    time.sleep(2)
     for i in range(num_workers):
         pane = f"{session}:{window}.{i}"
-        wait_for_pane_ready(pane, timeout=15)
+        if wait_for_pane_ready(pane, timeout=10):
+            print(f"  Worker {i} cleared")
+        else:
+            # Retry the clear
+            run_tmux(["send-keys", "-t", pane, "/clear"])
+            time.sleep(0.1)
+            run_tmux(["send-keys", "-t", pane, "Enter"])
+            wait_for_pane_ready(pane, timeout=10)
 
     # Inject manager preamble as first message
     preamble = get_manager_preamble(num_workers, workspace)
@@ -287,16 +302,20 @@ def start_swarm(
     print(f"  Workers: {num_workers} (panes 0-{num_workers-1})")
     print(f"  Manager: pane {num_workers}")
 
-    # Open Terminal window attached to swarm
+    # Open Terminal window attached to swarm in fullscreen
     subprocess.run([
         "osascript", "-e",
         '''tell application "Terminal"
             activate
             do script "tmux attach -t swarm"
+            delay 0.5
+            tell application "System Events"
+                keystroke "f" using {command down, control down}
+            end tell
         end tell'''
     ], check=False)
 
-    print(f"\nTerminal window opened with swarm session.")
+    print(f"\nTerminal window opened in fullscreen.")
 
 
 def stop_swarm() -> None:
