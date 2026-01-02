@@ -8,11 +8,11 @@ HyperClaude creates a tmux-based swarm of Claude Code instances: one **manager**
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ tmux session: swarm                                          │
+│ tmux session: swarm                                         │
 ├──────────┬──────────┬──────────┬──────────┬──────────┬──────┤
 │ Worker 0 │ Worker 1 │ Worker 2 │ Worker 3 │ Worker 4 │ W 5  │
 ├──────────┴──────────┴──────────┴──────────┴──────────┴──────┤
-│ Manager (coordinates all workers)                            │
+│ Manager (coordinates all workers)                           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
