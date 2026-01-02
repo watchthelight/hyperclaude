@@ -18,10 +18,12 @@ HyperClaude creates a tmux-based swarm of Claude Code instances: one **manager**
 
 ## Requirements
 
-- macOS
+- macOS or Linux
 - Python 3.10+
 - [tmux](https://github.com/tmux/tmux)
 - [Claude Code CLI](https://github.com/anthropics/claude-code)
+
+**Linux users**: Requires a supported terminal emulator (gnome-terminal, konsole, xfce4-terminal, alacritty, kitty, or xterm).
 
 ## Installation
 

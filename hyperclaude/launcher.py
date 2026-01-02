@@ -1,12 +1,73 @@
 """Tmux session management for HyperClaude swarm."""
 
 import os
+import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Optional
 
 from .config import load_config, get_hyperclaude_dir, init_hyperclaude
+
+
+def get_platform() -> str:
+    """Detect the current platform."""
+    if sys.platform == "darwin":
+        return "macos"
+    elif sys.platform.startswith("linux"):
+        return "linux"
+    else:
+        return "unknown"
+
+
+def find_linux_terminal() -> Optional[list[str]]:
+    """Find available terminal emulator on Linux."""
+    terminals = [
+        ("gnome-terminal", ["gnome-terminal", "--", "tmux", "attach", "-t", "swarm"]),
+        ("konsole", ["konsole", "-e", "tmux", "attach", "-t", "swarm"]),
+        ("xfce4-terminal", ["xfce4-terminal", "-e", "tmux attach -t swarm"]),
+        ("alacritty", ["alacritty", "-e", "tmux", "attach", "-t", "swarm"]),
+        ("kitty", ["kitty", "tmux", "attach", "-t", "swarm"]),
+        ("xterm", ["xterm", "-e", "tmux", "attach", "-t", "swarm"]),
+    ]
+    for name, cmd in terminals:
+        if shutil.which(name):
+            return cmd
+    return None
+
+
+def open_terminal_with_swarm(session: str) -> bool:
+    """Open a terminal window attached to the swarm session."""
+    platform = get_platform()
+
+    if platform == "macos":
+        subprocess.run([
+            "osascript", "-e",
+            f'''tell application "Terminal"
+                activate
+                do script "tmux attach -t {session}"
+                delay 0.5
+                tell application "System Events"
+                    keystroke "f" using {{command down, control down}}
+                end tell
+            end tell'''
+        ], check=False)
+        return True
+
+    elif platform == "linux":
+        terminal_cmd = find_linux_terminal()
+        if terminal_cmd:
+            subprocess.Popen(terminal_cmd, start_new_session=True)
+            return True
+        else:
+            print("No supported terminal found. Attach manually: tmux attach -t swarm")
+            return False
+
+    else:
+        print(f"Unsupported platform: {sys.platform}")
+        print("Attach manually: tmux attach -t swarm")
+        return False
 
 
 def run_tmux(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -302,20 +363,11 @@ def start_swarm(
     print(f"  Workers: {num_workers} (panes 0-{num_workers-1})")
     print(f"  Manager: pane {num_workers}")
 
-    # Open Terminal window attached to swarm in fullscreen
-    subprocess.run([
-        "osascript", "-e",
-        '''tell application "Terminal"
-            activate
-            do script "tmux attach -t swarm"
-            delay 0.5
-            tell application "System Events"
-                keystroke "f" using {command down, control down}
-            end tell
-        end tell'''
-    ], check=False)
-
-    print(f"\nTerminal window opened in fullscreen.")
+    # Open terminal window attached to swarm
+    if open_terminal_with_swarm(session):
+        print(f"\nTerminal window opened.")
+    else:
+        print(f"\nAttach manually: tmux attach -t {session}")
 
 
 def stop_swarm() -> None:
