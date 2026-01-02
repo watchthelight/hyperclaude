@@ -57,10 +57,10 @@ def main(ctx, workers, continue_session, model, workspace, session_name):
     target_workspace = Path(workspace) if workspace else Path.cwd()
     name = session_name or "swarm"
 
-    # Check if this specific session is already running
+    # Stop existing session if running
     if is_swarm_running(name):
-        click.echo(f"Session '{name}' is already running. Use 'hyperclaude stop --name {name}' first.")
-        sys.exit(1)
+        click.echo(f"Stopping existing session '{name}'...")
+        stop_swarm(name)
 
     click.echo(f"Starting hyperclaude swarm...")
     click.echo(f"  Session: {name}")
