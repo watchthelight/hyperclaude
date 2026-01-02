@@ -17,7 +17,9 @@ from .launcher import (
 @click.group(invoke_without_command=True)
 @click.option("--workers", "-w", type=int, help="Number of worker instances")
 @click.option("--continue", "-c", "continue_session", is_flag=True, help="Resume manager conversation")
-@click.option("--model", "-m", type=str, help="Model to use for all instances")
+@click.option("--opus", "model", flag_value="opus", default=True, help="Use Opus model (default)")
+@click.option("--sonnet", "model", flag_value="sonnet", help="Use Sonnet model")
+@click.option("--haiku", "model", flag_value="haiku", help="Use Haiku model")
 @click.option("--dir", "-d", "workspace", type=click.Path(exists=True), help="Workspace directory (default: current)")
 @click.option("--name", "-n", "session_name", type=str, help="Session name (for multiple swarms)")
 @click.pass_context
@@ -29,10 +31,11 @@ def main(ctx, workers, continue_session, model, workspace, session_name):
 
     \b
     Examples:
-        hyperclaude                    Start swarm in current directory
+        hyperclaude                    Start swarm with Opus (default)
+        hyperclaude --sonnet           Start with Sonnet model
+        hyperclaude --haiku            Start with Haiku model
         hyperclaude --workers 4        Start with 4 workers
         hyperclaude --name project1    Start named session
-        hyperclaude --continue         Resume previous manager session
         hyperclaude -d /path/to/proj   Start in specific directory
         hyperclaude sessions           List active sessions
         hyperclaude stop               Stop the swarm
@@ -53,7 +56,7 @@ def main(ctx, workers, continue_session, model, workspace, session_name):
 
     # Override with CLI options
     num_workers = workers or config["default_workers"]
-    model_name = model or config["default_model"]
+    model_name = model or "opus"
     target_workspace = Path(workspace) if workspace else Path.cwd()
     name = session_name or "swarm"
 
