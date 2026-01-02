@@ -15,6 +15,19 @@ def run_tmux(args: list[str], check: bool = True) -> subprocess.CompletedProcess
     return subprocess.run(cmd, capture_output=True, text=True, check=check)
 
 
+def wait_for_pane_ready(pane: str, timeout: int = 30) -> bool:
+    """Wait until Claude shows its input prompt (>) in the pane."""
+    import re
+    for _ in range(timeout * 2):  # Check every 0.5s
+        result = run_tmux(["capture-pane", "-t", pane, "-p"], check=False)
+        if result.returncode == 0:
+            # Look for Claude's prompt: a line with just ">"
+            if re.search(r'^\s*>\s*$', result.stdout, re.MULTILINE):
+                return True
+        time.sleep(0.5)
+    return False
+
+
 def is_swarm_running() -> bool:
     """Check if a swarm tmux session exists."""
     config = load_config()
@@ -224,13 +237,15 @@ def start_swarm(
         "-x", "200", "-y", "50",
     ])
 
-    # Start Claude in pane 0
-    run_tmux(["send-keys", "-t", f"{session}:{window}", f"claude --dangerously-skip-permissions", "Enter"])
+    # Start Claude in pane 0 (Enter must be separate!)
+    run_tmux(["send-keys", "-t", f"{session}:{window}", "claude --dangerously-skip-permissions"])
+    run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
 
     # Create remaining worker panes (1 to num_workers-1)
     for i in range(1, num_workers):
         run_tmux(["split-window", "-t", f"{session}:{window}", "-h", "-c", str(workspace)])
-        run_tmux(["send-keys", "-t", f"{session}:{window}", f"claude --dangerously-skip-permissions", "Enter"])
+        run_tmux(["send-keys", "-t", f"{session}:{window}", "claude --dangerously-skip-permissions"])
+        run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
         run_tmux(["select-layout", "-t", f"{session}:{window}", "tiled"])
 
     # Create manager pane (last pane)
@@ -244,10 +259,36 @@ def start_swarm(
 
     # Start manager Claude
     manager_pane = f"{session}:{window}.{num_workers}"
-    run_tmux(["send-keys", "-t", manager_pane, manager_cmd, "Enter"])
+    run_tmux(["send-keys", "-t", manager_pane, manager_cmd])
+    run_tmux(["send-keys", "-t", manager_pane, "Enter"])
 
-    # Wait for Claude instances to start
-    time.sleep(3)
+    print("Waiting for Claude instances to initialize...")
+
+    # Wait for all workers to be ready
+    for i in range(num_workers):
+        pane = f"{session}:{window}.{i}"
+        if not wait_for_pane_ready(pane, timeout=30):
+            print(f"  Warning: Worker {i} may not be ready")
+        else:
+            print(f"  Worker {i} ready")
+
+    # Wait for manager to be ready
+    if not wait_for_pane_ready(manager_pane, timeout=30):
+        print("  Warning: Manager may not be ready")
+    else:
+        print("  Manager ready")
+
+    # Clear all workers to start fresh
+    for i in range(num_workers):
+        pane = f"{session}:{window}.{i}"
+        run_tmux(["send-keys", "-t", pane, "/clear"])
+        run_tmux(["send-keys", "-t", pane, "Enter"])
+
+    # Wait for workers to clear
+    time.sleep(1)
+    for i in range(num_workers):
+        pane = f"{session}:{window}.{i}"
+        wait_for_pane_ready(pane, timeout=15)
 
     # Inject manager preamble as first message
     preamble = get_manager_preamble(num_workers, workspace)
@@ -257,16 +298,24 @@ def start_swarm(
     preamble_file.write_text(preamble)
 
     # Send the preamble to manager
-    # We'll send it as the first user message
-    run_tmux(["send-keys", "-t", manager_pane, f"Read ~/.hyperclaude/manager-init.txt and acknowledge you understand your role as swarm manager. Then await my instructions."])
+    run_tmux(["send-keys", "-t", manager_pane, "Read ~/.hyperclaude/manager-init.txt and acknowledge you understand your role as swarm manager. Then await my instructions."])
     run_tmux(["send-keys", "-t", manager_pane, "Enter"])
 
     print(f"\nHyperClaude swarm started!")
     print(f"  Session: {session}")
     print(f"  Workers: {num_workers} (panes 0-{num_workers-1})")
     print(f"  Manager: pane {num_workers}")
-    print(f"\nTo attach: tmux attach -t {session}")
-    print(f"To stop:   hyperclaude stop")
+
+    # Open Terminal window attached to swarm
+    subprocess.run([
+        "osascript", "-e",
+        '''tell application "Terminal"
+            activate
+            do script "tmux attach -t swarm"
+        end tell'''
+    ], check=False)
+
+    print(f"\nTerminal window opened with swarm session.")
 
 
 def stop_swarm() -> None:
