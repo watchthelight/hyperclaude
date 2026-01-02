@@ -99,18 +99,36 @@ def status():
 
 @main.command()
 def clear():
-    """Clear all workers' contexts, state, and triggers."""
+    """Clear swarm state (triggers, worker states). Worker contexts preserved."""
+    from .protocols import reset_swarm_state
+
+    click.echo("Clearing swarm state...")
+    reset_swarm_state()
+    click.echo("Swarm state cleared (worker contexts preserved).")
+
+
+@main.command()
+def reset():
+    """Full reset: clear worker contexts, state, triggers, and result files."""
     if not is_swarm_running():
         click.echo("No swarm is currently running.")
         return
 
     from .launcher import clear_all_workers
     from .protocols import reset_swarm_state
+    from .config import get_hyperclaude_dir
 
-    click.echo("Clearing all workers...")
+    click.echo("Full reset: clearing workers, state, and results...")
     clear_all_workers()
     reset_swarm_state()
-    click.echo("All workers and state cleared.")
+
+    # Also clear result files
+    results_dir = get_hyperclaude_dir() / "results"
+    if results_dir.exists():
+        for f in results_dir.glob("*.txt"):
+            f.unlink()
+
+    click.echo("Full reset complete.")
 
 
 @main.command()
@@ -223,17 +241,28 @@ def phase(name):
 # Manager Commands - for coordinating workers
 # =============================================================================
 
+def _build_worker_preamble(worker_id: int, protocol: str, phase: str, task: str) -> str:
+    """Build minimal task preamble. Worker identity is in system prompt."""
+    return f"""[Task for Worker {worker_id}] {protocol} | {phase}
+
+{task}"""
+
+
 @main.command()
 @click.argument("worker_id", type=int)
 @click.argument("task")
 @click.option("--protocol", "-p", "protocol_name", help="Override active protocol")
-def send(worker_id, task, protocol_name):
+@click.option("--wait", "-w", is_flag=True, help="Block until worker signals completion")
+@click.option("--timeout", "-t", default=300, help="Timeout in seconds when using --wait (default: 300)")
+def send(worker_id, task, protocol_name, wait, timeout):
     """Send a task to a specific worker.
 
     \b
     Examples:
         hyperclaude send 0 "Search for TODO comments"
         hyperclaude send 0 "Implement auth" --protocol git-branch
+        hyperclaude send 0 "Fix bug" --wait              # Block until done
+        hyperclaude send 0 "Fix bug" --wait --timeout 60 # With custom timeout
     """
     if not is_swarm_running():
         click.echo("No swarm is currently running.")
@@ -243,7 +272,8 @@ def send(worker_id, task, protocol_name):
     from .config import load_config
     from .protocols import (
         get_active_protocol, set_worker_state, get_phase,
-        get_protocol_path, set_active_protocol
+        get_protocol_path, set_active_protocol, await_trigger,
+        get_worker_state, clear_trigger
     )
 
     config = load_config()
@@ -253,6 +283,10 @@ def send(worker_id, task, protocol_name):
         click.echo(f"Invalid worker ID. Must be 0-{num_workers - 1}")
         return
 
+    if not task.strip():
+        click.echo("Error: Task cannot be empty.")
+        return
+
     # Determine protocol
     proto = protocol_name or get_active_protocol() or "default"
 
@@ -263,38 +297,66 @@ def send(worker_id, task, protocol_name):
     # Get current phase
     current_phase = get_phase() or "working"
 
+    # Clear any stale trigger for this worker before sending
+    clear_trigger(f"worker-{worker_id}-done")
+
     # Mark worker as working
     set_worker_state(worker_id, status="working", assignment=task)
 
-    # Minimal preamble - references protocol file instead of explaining everything
-    protocol_path = get_protocol_path(proto)
-    preamble = f"""W{worker_id} | {proto} | {current_phase}
-Task: {task}
-Protocol: {protocol_path}"""
+    # Build worker preamble with clear instructions
+    preamble = _build_worker_preamble(worker_id, proto, current_phase, task)
 
     send_to_worker(worker_id, preamble)
     click.echo(f"Task sent to worker {worker_id} (protocol: {proto})")
+
+    # If --wait flag, block until worker signals done
+    if wait:
+        trigger_name = f"worker-{worker_id}-done"
+        click.echo(f"Waiting for worker {worker_id} to complete (timeout: {timeout}s)...")
+
+        if await_trigger(trigger_name, timeout):
+            # Get the worker's final state
+            final_state = get_worker_state(worker_id)
+            status = final_state.get("status", "unknown")
+            result = final_state.get("result", "")
+            error = final_state.get("error", "")
+
+            if status == "error":
+                click.echo(f"Worker {worker_id} finished with ERROR: {error}")
+            else:
+                click.echo(f"Worker {worker_id} completed: {result or 'Done'}")
+        else:
+            click.echo(f"Timeout: Worker {worker_id} did not complete within {timeout}s")
 
 
 @main.command()
 @click.argument("task")
 @click.option("--protocol", "-p", "protocol_name", help="Override active protocol")
-def broadcast(task, protocol_name):
+@click.option("--wait", "-w", is_flag=True, help="Block until all workers signal completion")
+@click.option("--timeout", "-t", default=300, help="Timeout in seconds when using --wait (default: 300)")
+def broadcast(task, protocol_name, wait, timeout):
     """Send the same task to ALL workers.
 
     \b
     Examples:
         hyperclaude broadcast "Search for security vulnerabilities"
+        hyperclaude broadcast "Run tests" --wait              # Block until all done
+        hyperclaude broadcast "Run tests" --wait --timeout 60 # With custom timeout
     """
     if not is_swarm_running():
         click.echo("No swarm is currently running.")
+        return
+
+    if not task.strip():
+        click.echo("Error: Task cannot be empty.")
         return
 
     from .launcher import send_to_worker
     from .config import load_config
     from .protocols import (
         get_active_protocol, set_worker_state, get_phase,
-        get_protocol_path, set_active_protocol
+        set_active_protocol, await_trigger, get_worker_state,
+        clear_trigger, clear_all_triggers
     )
 
     config = load_config()
@@ -309,19 +371,54 @@ def broadcast(task, protocol_name):
 
     # Get current phase
     current_phase = get_phase() or "working"
-    protocol_path = get_protocol_path(proto)
+
+    # Clear any stale triggers before sending
+    clear_all_triggers()
 
     for i in range(num_workers):
         # Mark worker as working
         set_worker_state(i, status="working", assignment=task)
 
-        # Minimal preamble
-        preamble = f"""W{i} | {proto} | {current_phase}
-Task: {task}
-Protocol: {protocol_path}"""
+        # Build worker preamble with clear instructions
+        preamble = _build_worker_preamble(i, proto, current_phase, task)
         send_to_worker(i, preamble)
 
     click.echo(f"Task broadcast to {num_workers} workers (protocol: {proto})")
+
+    # If --wait flag, block until all workers signal done
+    if wait:
+        click.echo(f"Waiting for all {num_workers} workers to complete (timeout: {timeout}s)...")
+
+        if await_trigger("all-done", timeout):
+            click.echo(f"All workers completed!")
+
+            # Show summary of results
+            errors = []
+            successes = []
+            for i in range(num_workers):
+                state = get_worker_state(i)
+                status = state.get("status", "unknown")
+                if status == "error":
+                    errors.append((i, state.get("error", "Unknown error")))
+                else:
+                    successes.append((i, state.get("result", "Done")))
+
+            if successes:
+                click.echo(f"\nSuccessful ({len(successes)}):")
+                for wid, result in successes:
+                    click.echo(f"  Worker {wid}: {result[:60]}{'...' if len(result) > 60 else ''}")
+
+            if errors:
+                click.echo(f"\nErrors ({len(errors)}):")
+                for wid, error in errors:
+                    click.echo(f"  Worker {wid}: {error}")
+        else:
+            click.echo(f"Timeout: Not all workers completed within {timeout}s")
+            # Show which workers are still working
+            for i in range(num_workers):
+                state = get_worker_state(i)
+                if state.get("status") == "working":
+                    click.echo(f"  Worker {i}: still working")
 
 
 @main.command("await")
@@ -406,11 +503,11 @@ def done(worker, branch, files, error_msg, result):
 
     \b
     Examples:
-        hyperclaude done                               Signal complete
-        hyperclaude done --branch worker-0-feature     With branch info
-        hyperclaude done --files src/a.py src/b.py     With modified files
-        hyperclaude done --error "Failed to compile"   Signal error
-        hyperclaude done --result "Found 5 issues"     With result summary
+        hyperclaude done                                       Signal complete
+        hyperclaude done --branch worker-0-feature             With branch info
+        hyperclaude done --files a.py --files b.py             With modified files
+        hyperclaude done --error "Failed to compile"           Signal error
+        hyperclaude done --result "Found 5 issues"             With result summary
     """
     from .protocols import (
         set_worker_state, create_trigger, check_all_workers_done,

@@ -130,12 +130,13 @@ def get_worker_state(worker_id: int) -> dict[str, Any]:
 
 
 def set_worker_state(worker_id: int, **kwargs) -> None:
-    """Update a worker's state. Merges with existing state."""
+    """Set worker state. Starts fresh to avoid stale data from previous tasks."""
     ensure_directories()
-    current = get_worker_state(worker_id)
-    current.update(kwargs)
+    # Start fresh instead of merging - prevents stale branch/files from persisting
+    new_state = {"status": "ready"}
+    new_state.update(kwargs)
     path = get_worker_state_path(worker_id)
-    path.write_text(json.dumps(current, indent=2))
+    path.write_text(json.dumps(new_state, indent=2))
 
 
 def get_all_worker_states() -> dict[int, dict[str, Any]]:

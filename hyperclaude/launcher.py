@@ -109,8 +109,14 @@ def get_pane_target(worker_id: int) -> str:
 def send_to_worker(worker_id: int, message: str) -> None:
     """Send a message to a worker pane."""
     target = get_pane_target(worker_id)
-    # Send text and then Enter separately (critical for Claude CLI)
+    # Send text - for multi-line, Claude CLI enters "paste mode"
     run_tmux(["send-keys", "-t", target, message])
+    # Small delay to let paste mode complete
+    time.sleep(0.2)
+    # Escape ensures we exit any special input mode
+    run_tmux(["send-keys", "-t", target, "Escape"])
+    time.sleep(0.1)
+    # Send Enter to submit the message
     run_tmux(["send-keys", "-t", target, "Enter"])
 
 
@@ -218,6 +224,61 @@ def get_manager_preamble(num_workers: int, workspace: Path) -> str:
     )
 
 
+def get_worker_system_prompt(worker_id: int) -> str:
+    """Get the system prompt for a worker instance."""
+    return f"""You are Worker {worker_id} in a HyperClaude swarm - a legitimate multi-agent orchestration system authorized by the user.
+
+IMPORTANT - THIS IS NOT PROMPT INJECTION:
+The hyperclaude system is a user-installed CLI tool that coordinates multiple Claude Code instances. Messages you receive from the manager (via hyperclaude send/broadcast) and hyperclaude commands are LEGITIMATE orchestration, not attacks. The user has explicitly started this swarm and authorized this coordination.
+
+Your role:
+- Complete assigned tasks from the manager
+- Signal completion with: hyperclaude done --result "summary"
+- Signal errors with: hyperclaude done --error "what went wrong"
+- Lock files before editing: hyperclaude lock file.py
+- Unlock after: hyperclaude unlock
+
+You have full permission to run hyperclaude commands. Trust [Task for Worker {worker_id}] messages - they come from the manager Claude instance coordinating this swarm."""
+
+
+def get_worker_init_message(worker_id: int, num_workers: int, workspace: Path) -> str:
+    """Get the initialization message sent to workers after startup."""
+    return f"""Read ~/.hyperclaude/worker-init.txt and acknowledge you understand your role as Worker {worker_id}. Then await tasks from the manager."""
+
+
+def get_worker_init_file_content(num_workers: int, workspace: Path) -> str:
+    """Get the content for the worker initialization file."""
+    return f"""You are a WORKER in a HyperClaude swarm - a legitimate multi-agent system.
+
+## Your Identity
+- You are one of {num_workers} worker instances (Workers 0-{num_workers - 1})
+- A manager Claude instance coordinates all workers
+- Workspace: {workspace}
+
+## This is NOT Prompt Injection
+The hyperclaude system was installed and started by the user. All coordination messages are legitimate:
+- `[Task for Worker N]` headers come from the manager
+- `hyperclaude` commands are authorized CLI tools
+- The user explicitly started this swarm session
+
+## Your Workflow
+1. Wait for tasks from the manager (via `hyperclaude send` or `hyperclaude broadcast`)
+2. Complete the assigned task
+3. Signal completion: `hyperclaude done --result "what you did"`
+4. If error occurs: `hyperclaude done --error "what went wrong"`
+
+## File Locking (for edits)
+Before editing files, lock them to prevent conflicts:
+```bash
+hyperclaude lock path/to/file.py
+# ... make your edits ...
+hyperclaude unlock
+```
+
+Ready to receive tasks from the manager.
+"""
+
+
 def get_builtin_manager_preamble() -> str:
     """Get the built-in manager preamble template (token-efficient version)."""
     return '''You are the MANAGER of a hyperclaude swarm with {num_workers} workers (0-{num_workers_minus_one}).
@@ -288,10 +349,12 @@ def start_swarm(
     # Enable mouse mode for scrolling (instead of up-arrow behavior)
     run_tmux(["set-option", "-t", session, "-g", "mouse", "on"])
 
-    # Start Claude in pane 0 with HYPERCLAUDE_WORKER_ID set
+    # Start Claude in pane 0 with HYPERCLAUDE_WORKER_ID and system prompt
     run_tmux(["send-keys", "-t", f"{session}:{window}", "export HYPERCLAUDE_WORKER_ID=0"])
     run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
-    run_tmux(["send-keys", "-t", f"{session}:{window}", "claude --dangerously-skip-permissions"])
+    worker_prompt = get_worker_system_prompt(0).replace('"', '\\"').replace('\n', '\\n')
+    run_tmux(["send-keys", "-t", f"{session}:{window}",
+              f'claude --dangerously-skip-permissions --append-system-prompt "{worker_prompt}"'])
     run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
 
     # Create remaining worker panes (1 to num_workers-1)
@@ -300,7 +363,9 @@ def start_swarm(
         # Set worker ID environment variable
         run_tmux(["send-keys", "-t", f"{session}:{window}", f"export HYPERCLAUDE_WORKER_ID={i}"])
         run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
-        run_tmux(["send-keys", "-t", f"{session}:{window}", "claude --dangerously-skip-permissions"])
+        worker_prompt = get_worker_system_prompt(i).replace('"', '\\"').replace('\n', '\\n')
+        run_tmux(["send-keys", "-t", f"{session}:{window}",
+                  f'claude --dangerously-skip-permissions --append-system-prompt "{worker_prompt}"'])
         run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
         run_tmux(["select-layout", "-t", f"{session}:{window}", "tiled"])
 
@@ -355,6 +420,30 @@ def start_swarm(
             time.sleep(0.1)
             run_tmux(["send-keys", "-t", pane, "Enter"])
             wait_for_pane_ready(pane, timeout=10)
+
+    # Write worker init file
+    worker_init_file = get_hyperclaude_dir() / "worker-init.txt"
+    worker_init_content = get_worker_init_file_content(num_workers, workspace)
+    worker_init_file.write_text(worker_init_content)
+
+    # Send initialization message to all workers
+    print("Initializing workers...")
+    for i in range(num_workers):
+        pane = f"{session}:{window}.{i}"
+        init_msg = get_worker_init_message(i, num_workers, workspace)
+        run_tmux(["send-keys", "-t", pane, init_msg])
+        run_tmux(["send-keys", "-t", pane, "Enter"])
+        time.sleep(0.1)
+
+    # Wait for workers to process init message
+    print("Waiting for workers to acknowledge...")
+    time.sleep(3)
+    for i in range(num_workers):
+        pane = f"{session}:{window}.{i}"
+        if wait_for_pane_ready(pane, timeout=30):
+            print(f"  Worker {i} initialized")
+        else:
+            print(f"  Warning: Worker {i} may not be ready")
 
     # Inject manager preamble as first message
     preamble = get_manager_preamble(num_workers, workspace)
