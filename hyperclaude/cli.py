@@ -554,5 +554,56 @@ def locks():
             click.echo(f"  {line}")
 
 
+# =============================================================================
+# Setup Commands
+# =============================================================================
+
+@main.command()
+@click.option("--check", "-c", is_flag=True, help="Only check, don't configure")
+def setup(check):
+    """Configure Claude Code permissions for hyperclaude.
+
+    Adds pre-authorized permissions to ~/.claude/settings.json:
+    - Read(~/.hyperclaude/**) - Read config and protocol files
+    - Bash(hyperclaude:*) - Run hyperclaude CLI commands
+
+    \b
+    Examples:
+        hyperclaude setup          Configure permissions
+        hyperclaude setup --check  Check current status
+    """
+    from .config import configure_claude_permissions, check_claude_permissions, get_claude_settings_path
+
+    if check:
+        # Just check status
+        perms = check_claude_permissions()
+        settings_path = get_claude_settings_path()
+
+        click.echo(f"Claude settings: {settings_path}")
+        click.echo("=" * 50)
+
+        all_configured = True
+        for perm, configured in perms.items():
+            status = "configured" if configured else "NOT configured"
+            symbol = "✓" if configured else "✗"
+            click.echo(f"  {symbol} {perm}: {status}")
+            if not configured:
+                all_configured = False
+
+        if all_configured:
+            click.echo("\nAll permissions configured.")
+        else:
+            click.echo("\nRun 'hyperclaude setup' to configure missing permissions.")
+    else:
+        # Configure permissions
+        if configure_claude_permissions():
+            click.echo("Claude Code permissions configured successfully!")
+            click.echo("\nAdded to ~/.claude/settings.json:")
+            click.echo("  - Read(~/.hyperclaude/**)")
+            click.echo("  - Bash(hyperclaude:*)")
+        else:
+            click.echo("Permissions already configured.")
+
+
 if __name__ == "__main__":
     main()

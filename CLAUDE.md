@@ -45,11 +45,14 @@ hyperclaude creates a tmux session with:
 3. **Manager is interactive**: Uses normal Claude permissions (no bypass)
 4. **File-based coordination**: State in `~/.hyperclaude/state/`, triggers in `~/.hyperclaude/triggers/`
 5. **HYPERCLAUDE_WORKER_ID**: Environment variable auto-set for each worker
+6. **Auto-configured permissions**: Adds `Read(~/.hyperclaude/**)` and `Bash(hyperclaude:*)` to `~/.claude/settings.json`
 
 ## CLI Commands
 
-### Starting/Stopping
+### Setup & Starting/Stopping
 ```bash
+hyperclaude setup               # Configure Claude Code permissions
+hyperclaude setup --check       # Check permission status
 hyperclaude                     # Start swarm in current directory
 hyperclaude --workers 4         # Start with 4 workers
 hyperclaude -d /path/to/proj    # Start in specific directory

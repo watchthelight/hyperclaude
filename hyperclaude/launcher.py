@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .config import load_config, get_hyperclaude_dir, init_hyperclaude
+from .config import load_config, get_hyperclaude_dir, init_hyperclaude, configure_claude_permissions
 
 
 def get_platform() -> str:
@@ -265,6 +265,10 @@ def start_swarm(
     # Initialize directories and install default protocols
     init_hyperclaude()
     install_default_protocols()
+
+    # Configure Claude Code permissions for hyperclaude
+    if configure_claude_permissions():
+        print("Configured Claude Code permissions for hyperclaude")
 
     # Reset swarm state for fresh start
     reset_swarm_state()

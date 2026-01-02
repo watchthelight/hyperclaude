@@ -1,5 +1,6 @@
-"""Configuration management for HyperClaude."""
+"""Configuration management for hyperclaude."""
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -145,3 +146,89 @@ def clear_all_worker_states() -> None:
     if state_dir.exists():
         for state_file in state_dir.glob("*.state"):
             state_file.unlink()
+
+
+# =============================================================================
+# Claude Code Settings Configuration
+# =============================================================================
+
+def get_claude_settings_path() -> Path:
+    """Get the path to Claude Code's user settings file."""
+    return Path.home() / ".claude" / "settings.json"
+
+
+def configure_claude_permissions() -> bool:
+    """
+    Configure Claude Code settings to pre-authorize hyperclaude operations.
+
+    Adds the following permissions to ~/.claude/settings.json:
+    - Read(~/.hyperclaude/**) - Read hyperclaude config and protocol files
+    - Bash(hyperclaude:*) - Run hyperclaude CLI commands
+
+    Returns True if settings were updated, False if already configured.
+    """
+    settings_path = get_claude_settings_path()
+
+    # Permissions we need for hyperclaude
+    required_permissions = [
+        "Read(~/.hyperclaude/**)",
+        "Bash(hyperclaude:*)",
+    ]
+
+    # Load existing settings or create new
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text())
+        except json.JSONDecodeError:
+            settings = {}
+    else:
+        settings = {}
+
+    # Ensure permissions structure exists
+    if "permissions" not in settings:
+        settings["permissions"] = {}
+    if "allow" not in settings["permissions"]:
+        settings["permissions"]["allow"] = []
+
+    # Check which permissions are missing
+    current_allow = settings["permissions"]["allow"]
+    missing = [p for p in required_permissions if p not in current_allow]
+
+    if not missing:
+        # Already configured
+        return False
+
+    # Add missing permissions
+    settings["permissions"]["allow"].extend(missing)
+
+    # Ensure directory exists
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write updated settings
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+
+    return True
+
+
+def check_claude_permissions() -> dict[str, bool]:
+    """
+    Check if Claude Code has the required permissions configured.
+
+    Returns a dict mapping permission to whether it's configured.
+    """
+    settings_path = get_claude_settings_path()
+
+    required_permissions = [
+        "Read(~/.hyperclaude/**)",
+        "Bash(hyperclaude:*)",
+    ]
+
+    if not settings_path.exists():
+        return {p: False for p in required_permissions}
+
+    try:
+        settings = json.loads(settings_path.read_text())
+        current_allow = settings.get("permissions", {}).get("allow", [])
+        return {p: p in current_allow for p in required_permissions}
+    except json.JSONDecodeError:
+        return {p: False for p in required_permissions}

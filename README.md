@@ -14,6 +14,8 @@ git clone https://github.com/watchthelight/hyperclaude.git && cd hyperclaude && 
 git clone https://github.com/watchthelight/hyperclaude.git && cd hyperclaude && python3 -m venv .venv && source .venv/bin/activate && pip install -e .
 ```
 
+After installation, run `hyperclaude setup` to configure Claude Code permissions (done automatically on first swarm start).
+
 ## What is hyperclaude?
 
 hyperclaude creates a tmux-based swarm of Claude Code instances: one **manager** that coordinates work, and multiple **workers** that execute tasks in parallel.
