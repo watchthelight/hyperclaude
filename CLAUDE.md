@@ -46,15 +46,30 @@ HyperClaude creates a tmux session with:
 
 ## CLI Commands
 
+### User Commands
 ```bash
 hyperclaude                     # Start swarm in current directory
 hyperclaude --workers 4         # Start with 4 workers
-hyperclaude --continue          # Resume manager conversation
 hyperclaude -d /path/to/proj    # Start in specific directory
 hyperclaude stop                # Gracefully shutdown swarm
+```
+
+### Manager Commands (for coordinating workers)
+```bash
+hyperclaude send 0 "task"       # Send task to worker 0
+hyperclaude broadcast "task"    # Send task to ALL workers
+hyperclaude wait                # Wait for all workers to finish
 hyperclaude status              # Show worker status
-hyperclaude clear               # Clear all workers
 hyperclaude results             # Show worker results
+hyperclaude clear               # Clear all workers
+hyperclaude locks               # Show active file locks
+```
+
+### Worker Commands (for reporting results)
+```bash
+hyperclaude report "result" -w 0      # Write result for worker 0
+hyperclaude lock file1.py file2.py -w 0  # Claim file locks
+hyperclaude unlock -w 0               # Release locks
 ```
 
 ## Development
