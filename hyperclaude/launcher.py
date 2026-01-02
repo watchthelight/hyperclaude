@@ -132,6 +132,28 @@ def get_worker_tokens(worker_id: int) -> Optional[int]:
     return None
 
 
+def is_worker_idle(worker_id: int) -> bool:
+    """Check if a worker is idle (showing prompt, not typing).
+
+    A worker is idle if:
+    - The Claude prompt (>) is visible in recent output
+    - There's no active streaming/typing indicator
+    """
+    import re
+    output = capture_pane(worker_id, lines=20)
+
+    # Look for Claude's input prompt: a line that is just ">" with optional whitespace
+    # This appears when Claude is waiting for input
+    if re.search(r'^\s*>\s*$', output, re.MULTILINE):
+        return True
+
+    # Check for "Thinking" indicator which means still processing
+    if '∴ Thinking' in output or '∴ Thinking…' in output:
+        return False
+
+    return False
+
+
 def clear_worker(worker_id: int) -> None:
     """Clear a worker's context."""
     send_to_worker(worker_id, "/clear")
@@ -149,18 +171,23 @@ def clear_all_workers() -> None:
 
 def get_swarm_status() -> dict:
     """Get status information for all workers."""
+    from .config import get_worker_state
+
     config = load_config()
     num_workers = config["default_workers"]
 
     status = {}
     for i in range(num_workers):
         tokens = get_worker_tokens(i)
-        if tokens == 0:
+        worker_state = get_worker_state(i)
+
+        # Use explicit state from state file
+        if worker_state == "WORKING":
+            state = "working"
+        elif tokens == 0 or tokens is None:
             state = "ready"
-        elif tokens is None:
-            state = "unknown"
         else:
-            state = "active"
+            state = "idle"  # Has context but not actively working
 
         status[i] = {
             "tokens": tokens,
@@ -192,66 +219,33 @@ def get_manager_preamble(num_workers: int, workspace: Path) -> str:
 
 
 def get_builtin_manager_preamble() -> str:
-    """Get the built-in manager preamble template."""
-    return '''You are the MANAGER in a HyperClaude swarm. You coordinate {num_workers} worker Claude instances (Workers 0-{num_workers_minus_one}).
+    """Get the built-in manager preamble template (token-efficient version)."""
+    return '''You are the MANAGER of a hyperclaude swarm with {num_workers} workers (0-{num_workers_minus_one}).
 
-## CLI Commands
+## Quick Reference
 
-**Send task to one worker:**
 ```bash
-hyperclaude send 0 "Search for TODO comments in src/"
+hyperclaude protocol git-branch      # Set protocol (default, git-branch, search, review)
+hyperclaude phase working            # Set phase
+hyperclaude send 0 "task"            # Send task to worker
+hyperclaude broadcast "task"         # Send to all workers
+hyperclaude await all-done           # Wait for completion
+hyperclaude state                    # View worker states
+hyperclaude results                  # View detailed results
+hyperclaude clear                    # Reset for next batch
 ```
 
-**Send task to ALL workers:**
-```bash
-hyperclaude broadcast "Find security vulnerabilities"
-```
+## Protocols
 
-**Wait for all workers to finish:**
-```bash
-hyperclaude wait
-```
+Read protocol docs: `cat ~/.hyperclaude/protocols/<name>.md`
+- **default** - Basic task execution
+- **git-branch** - Workers on separate branches, manager merges
+- **search** - Parallel search and aggregate
+- **review** - Code review workflow
 
-**Check worker status:**
-```bash
-hyperclaude status
-```
+Workers signal completion with `hyperclaude done`. Triggers auto-notify you.
 
-**View results:**
-```bash
-hyperclaude results
-```
-
-**Clear all workers:**
-```bash
-hyperclaude clear
-```
-
-**Check file locks:**
-```bash
-hyperclaude locks
-```
-
-## How It Works
-
-1. Use `hyperclaude send N "task"` to assign work to worker N
-2. The worker receives the task with instructions to use `hyperclaude report` when done
-3. Use `hyperclaude wait` to block until all workers finish
-4. Use `hyperclaude results` to see all outputs
-
-Workers automatically get instructions to:
-- Run `hyperclaude report "result"` when done
-- Run `hyperclaude lock file.py` before editing files
-- Run `hyperclaude unlock` when done editing
-
-## Best Practices
-
-1. **Divide by file** - assign different workers to different files/directories
-2. **Use broadcast** for parallel searches across the codebase
-3. **Use send** for specific tasks that need one worker
-4. **Check locks** if workers report conflicts
-
-Current workspace: {workspace}
+Workspace: {workspace}
 '''
 
 
@@ -261,13 +255,19 @@ def start_swarm(
     model: str,
     continue_session: bool = False,
 ) -> None:
-    """Start the HyperClaude swarm."""
+    """Start the hyperclaude swarm."""
+    from .protocols import install_default_protocols, reset_swarm_state
+
     config = load_config()
     session = config["tmux_session"]
     window = config["tmux_window"]
 
-    # Initialize directories
+    # Initialize directories and install default protocols
     init_hyperclaude()
+    install_default_protocols()
+
+    # Reset swarm state for fresh start
+    reset_swarm_state()
 
     # Kill existing session if any
     run_tmux(["kill-session", "-t", session], check=False)
@@ -284,13 +284,18 @@ def start_swarm(
     # Enable mouse mode for scrolling (instead of up-arrow behavior)
     run_tmux(["set-option", "-t", session, "-g", "mouse", "on"])
 
-    # Start Claude in pane 0 (Enter must be separate!)
+    # Start Claude in pane 0 with HYPERCLAUDE_WORKER_ID set
+    run_tmux(["send-keys", "-t", f"{session}:{window}", "export HYPERCLAUDE_WORKER_ID=0"])
+    run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
     run_tmux(["send-keys", "-t", f"{session}:{window}", "claude --dangerously-skip-permissions"])
     run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
 
     # Create remaining worker panes (1 to num_workers-1)
     for i in range(1, num_workers):
         run_tmux(["split-window", "-t", f"{session}:{window}", "-h", "-c", str(workspace)])
+        # Set worker ID environment variable
+        run_tmux(["send-keys", "-t", f"{session}:{window}", f"export HYPERCLAUDE_WORKER_ID={i}"])
+        run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
         run_tmux(["send-keys", "-t", f"{session}:{window}", "claude --dangerously-skip-permissions"])
         run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
         run_tmux(["select-layout", "-t", f"{session}:{window}", "tiled"])
@@ -299,8 +304,8 @@ def start_swarm(
     run_tmux(["split-window", "-t", f"{session}:{window}", "-v", "-c", str(workspace)])
     run_tmux(["select-layout", "-t", f"{session}:{window}", "tiled"])
 
-    # Build manager command
-    manager_cmd = "claude --dangerously-skip-permissions"
+    # Build manager command (no bypass - manager uses normal permissions)
+    manager_cmd = "claude"
     if continue_session:
         manager_cmd += " --continue"
 

@@ -1,4 +1,4 @@
-# HyperClaude
+# hyperclaude
 
 Swarm orchestration for Claude Code - coordinate multiple Claude instances for parallel task execution.
 
@@ -8,22 +8,23 @@ Swarm orchestration for Claude Code - coordinate multiple Claude instances for p
 hyperclaude/
 ├── pyproject.toml              # Package configuration
 ├── CLAUDE.md                   # This file
-├── swarm.sh                    # Helper script for swarm management
-├── launch.sh                   # Legacy launcher (deprecated)
 └── hyperclaude/
     ├── __init__.py
     ├── cli.py                  # Click-based CLI entry point
     ├── config.py               # Configuration and directory management
     ├── launcher.py             # Tmux session creation and management
-    ├── monitor.py              # Log capture and usage tracking
+    ├── protocols.py            # Protocol and state management
     └── templates/
-        ├── manager-preamble.md # Template for manager initialization
-        └── worker-preamble.md  # Template for worker task prefix
+        └── protocols/          # Default protocol templates
+            ├── default.md
+            ├── git-branch.md
+            ├── search.md
+            └── review.md
 ```
 
 ## Architecture
 
-HyperClaude creates a tmux session with:
+hyperclaude creates a tmux session with:
 - **N Worker panes** (default 6): Independent Claude instances for parallel work
 - **1 Manager pane**: Coordinates workers, delegates tasks, aggregates results
 
@@ -39,14 +40,15 @@ HyperClaude creates a tmux session with:
 
 ## Key Design Decisions
 
-1. **Workers are stateless**: Cleared before new task batches, receive full context with each task
-2. **Manager is stateful**: Can use `--continue` to resume conversations
-3. **File-based coordination**: Results in `~/.hyperclaude/results/`, locks in `~/.hyperclaude/locks/`
-4. **Separate config**: All HyperClaude data in `~/.hyperclaude/`, doesn't touch target workspaces
+1. **Token-efficient protocols**: Workers read protocol docs from files, not inline prompts
+2. **Workers are stateless**: Cleared before new task batches
+3. **Manager is interactive**: Uses normal Claude permissions (no bypass)
+4. **File-based coordination**: State in `~/.hyperclaude/state/`, triggers in `~/.hyperclaude/triggers/`
+5. **HYPERCLAUDE_WORKER_ID**: Environment variable auto-set for each worker
 
 ## CLI Commands
 
-### User Commands
+### Starting/Stopping
 ```bash
 hyperclaude                     # Start swarm in current directory
 hyperclaude --workers 4         # Start with 4 workers
@@ -54,32 +56,57 @@ hyperclaude -d /path/to/proj    # Start in specific directory
 hyperclaude stop                # Gracefully shutdown swarm
 ```
 
-### Manager Commands (for coordinating workers)
+### Protocol & Phase Management
+```bash
+hyperclaude protocol git-branch # Set active protocol
+hyperclaude protocol            # Show current protocol
+hyperclaude protocols           # List available protocols
+hyperclaude phase working       # Set current phase
+hyperclaude phase               # Show current phase
+```
+
+### Manager Commands (coordinating workers)
 ```bash
 hyperclaude send 0 "task"       # Send task to worker 0
 hyperclaude broadcast "task"    # Send task to ALL workers
-hyperclaude wait                # Wait for all workers to finish
-hyperclaude status              # Show worker status
+hyperclaude await all-done      # Wait for all workers (trigger-based)
+hyperclaude state               # Show worker states (JSON-based)
 hyperclaude results             # Show worker results
-hyperclaude clear               # Clear all workers
+hyperclaude clear               # Clear all workers and reset state
 hyperclaude locks               # Show active file locks
 ```
 
-### Worker Commands (for reporting results)
+### Worker Commands (signaling completion)
 ```bash
-hyperclaude report "result" -w 0      # Write result for worker 0
-hyperclaude lock file1.py file2.py -w 0  # Claim file locks
-hyperclaude unlock -w 0               # Release locks
+hyperclaude done                      # Signal task complete
+hyperclaude done --branch X           # With branch info
+hyperclaude done --files a.py b.py    # With modified files
+hyperclaude done --error "msg"        # Signal error
+hyperclaude lock file1.py file2.py    # Claim file locks
+hyperclaude unlock                    # Release locks
 ```
 
-## Development
+## State Files
 
-```bash
-# Install in development mode
-pip install -e .
-
-# Run CLI
-hyperclaude --help
+```
+~/.hyperclaude/
+├── protocols/              # Protocol documentation
+│   ├── default.md
+│   ├── git-branch.md
+│   ├── search.md
+│   └── review.md
+├── state/
+│   ├── protocol            # Active protocol name
+│   ├── phase               # Current phase
+│   └── workers/
+│       ├── 0.json          # Worker 0 state (status, branch, files, etc.)
+│       └── ...
+├── triggers/               # Event files (presence = event occurred)
+│   ├── worker-0-done
+│   ├── all-done
+│   └── ...
+├── results/                # Worker result files
+└── locks/                  # File locks
 ```
 
 ## Important Implementation Notes
@@ -95,13 +122,17 @@ tmux send-keys -t pane "command" Enter
 tmux send-keys -t pane "command" && tmux send-keys -t pane Enter
 ```
 
-### Worker Task Protocol
+### Worker ID Auto-Detection
 
-Workers must be given explicit instructions with each task because they're cleared between batches. The worker preamble template includes:
-- Where to write results (`~/.hyperclaude/results/worker-N.txt`)
-- Result format (STATUS, TASK, RESULT, FILES_MODIFIED)
-- File locking protocol
+Workers have `HYPERCLAUDE_WORKER_ID` environment variable set. Commands like `hyperclaude done` and `hyperclaude lock` auto-detect the worker ID from this.
 
-### Manager Initialization
+### Token-Efficient Task Sending
 
-The manager receives its instructions via prepending to the first user message. It reads `~/.hyperclaude/manager-init.txt` which contains the full protocol documentation.
+Tasks are sent with minimal preamble:
+```
+W0 | git-branch | working
+Task: Implement user auth
+Protocol: ~/.hyperclaude/protocols/git-branch.md
+```
+
+Workers read the protocol file for full instructions (once per session).

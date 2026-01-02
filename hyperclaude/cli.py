@@ -1,4 +1,4 @@
-"""CLI entry point for HyperClaude."""
+"""CLI entry point for hyperclaude."""
 
 import click
 import sys
@@ -15,7 +15,7 @@ from .launcher import start_swarm, stop_swarm, get_swarm_status, is_swarm_runnin
 @click.option("--dir", "-d", "workspace", type=click.Path(exists=True), help="Workspace directory (default: current)")
 @click.pass_context
 def main(ctx, workers, continue_session, model, workspace):
-    """HyperClaude - Swarm orchestration for Claude Code.
+    """hyperclaude - Swarm orchestration for Claude Code.
 
     Start a swarm of Claude instances with one manager and multiple workers.
     The manager coordinates task delegation and result aggregation.
@@ -33,7 +33,7 @@ def main(ctx, workers, continue_session, model, workspace):
     if ctx.invoked_subcommand is not None:
         return
 
-    # Initialize HyperClaude directories
+    # Initialize hyperclaude directories
     init_hyperclaude()
 
     # Load configuration
@@ -49,7 +49,7 @@ def main(ctx, workers, continue_session, model, workspace):
         click.echo("A swarm is already running. Use 'hyperclaude stop' first, or 'hyperclaude status' to check.")
         sys.exit(1)
 
-    click.echo(f"Starting HyperClaude swarm...")
+    click.echo(f"Starting hyperclaude swarm...")
     click.echo(f"  Workers: {num_workers}")
     click.echo(f"  Model: {model_name}")
     click.echo(f"  Workspace: {target_workspace}")
@@ -72,21 +72,21 @@ def stop():
         click.echo("No swarm is currently running.")
         return
 
-    click.echo("Stopping HyperClaude swarm...")
+    click.echo("Stopping hyperclaude swarm...")
     stop_swarm()
     click.echo("Swarm stopped.")
 
 
 @main.command()
 def status():
-    """Show the status of all swarm workers."""
+    """Show the status of all swarm workers (legacy token-based)."""
     if not is_swarm_running():
         click.echo("No swarm is currently running.")
         return
 
     status_info = get_swarm_status()
 
-    click.echo("HyperClaude Swarm Status")
+    click.echo("hyperclaude Swarm Status")
     click.echo("=" * 40)
 
     for worker_id, info in status_info.items():
@@ -99,15 +99,18 @@ def status():
 
 @main.command()
 def clear():
-    """Clear all workers' contexts."""
+    """Clear all workers' contexts, state, and triggers."""
     if not is_swarm_running():
         click.echo("No swarm is currently running.")
         return
 
     from .launcher import clear_all_workers
+    from .protocols import reset_swarm_state
+
     click.echo("Clearing all workers...")
     clear_all_workers()
-    click.echo("All workers cleared.")
+    reset_swarm_state()
+    click.echo("All workers and state cleared.")
 
 
 @main.command()
@@ -138,16 +141,99 @@ def results():
 
 
 # =============================================================================
+# Protocol and Phase Management
+# =============================================================================
+
+@main.command()
+@click.argument("name", required=False)
+def protocol(name):
+    """Get or set the active protocol.
+
+    \b
+    Examples:
+        hyperclaude protocol              Show current protocol
+        hyperclaude protocol git-branch   Set active protocol
+    """
+    from .protocols import get_active_protocol, set_active_protocol, get_protocol, list_protocols
+
+    if name is None:
+        # Show current protocol
+        current = get_active_protocol()
+        if current:
+            click.echo(f"Active protocol: {current}")
+            click.echo(f"\nProtocol file: ~/.hyperclaude/protocols/{current}.md")
+        else:
+            click.echo("No protocol set. Use 'hyperclaude protocol <name>' to set one.")
+            click.echo(f"Available: {', '.join(list_protocols())}")
+    else:
+        # Set protocol
+        if set_active_protocol(name):
+            click.echo(f"Protocol set to: {name}")
+        else:
+            available = list_protocols()
+            click.echo(f"Protocol '{name}' not found.")
+            click.echo(f"Available: {', '.join(available)}")
+
+
+@main.command()
+def protocols():
+    """List available protocols."""
+    from .protocols import list_protocols, get_active_protocol
+
+    available = list_protocols()
+    current = get_active_protocol()
+
+    if not available:
+        click.echo("No protocols installed. Run 'hyperclaude' once to install defaults.")
+        return
+
+    click.echo("Available Protocols")
+    click.echo("=" * 40)
+    for name in available:
+        marker = " (active)" if name == current else ""
+        click.echo(f"  {name}{marker}")
+    click.echo()
+    click.echo("View protocol: cat ~/.hyperclaude/protocols/<name>.md")
+
+
+@main.command()
+@click.argument("name", required=False)
+def phase(name):
+    """Get or set the current phase.
+
+    \b
+    Examples:
+        hyperclaude phase             Show current phase
+        hyperclaude phase working     Set phase to 'working'
+    """
+    from .protocols import get_phase, set_phase
+
+    if name is None:
+        current = get_phase()
+        if current:
+            click.echo(f"Current phase: {current}")
+        else:
+            click.echo("No phase set.")
+    else:
+        set_phase(name)
+        click.echo(f"Phase set to: {name}")
+
+
+# =============================================================================
 # Manager Commands - for coordinating workers
 # =============================================================================
 
 @main.command()
 @click.argument("worker_id", type=int)
 @click.argument("task")
-def send(worker_id, task):
+@click.option("--protocol", "-p", "protocol_name", help="Override active protocol")
+def send(worker_id, task, protocol_name):
     """Send a task to a specific worker.
 
-    Example: hyperclaude send 0 "Search for TODO comments"
+    \b
+    Examples:
+        hyperclaude send 0 "Search for TODO comments"
+        hyperclaude send 0 "Implement auth" --protocol git-branch
     """
     if not is_swarm_running():
         click.echo("No swarm is currently running.")
@@ -155,6 +241,10 @@ def send(worker_id, task):
 
     from .launcher import send_to_worker
     from .config import load_config
+    from .protocols import (
+        get_active_protocol, set_worker_state, get_phase,
+        get_protocol_path, set_active_protocol
+    )
 
     config = load_config()
     num_workers = config["default_workers"]
@@ -163,28 +253,38 @@ def send(worker_id, task):
         click.echo(f"Invalid worker ID. Must be 0-{num_workers - 1}")
         return
 
-    # Add worker preamble to task
-    preamble = f"""You are Worker {worker_id} in a HyperClaude swarm.
+    # Determine protocol
+    proto = protocol_name or get_active_protocol() or "default"
 
-PROTOCOL:
-1. Complete the task autonomously
-2. When done, run: hyperclaude report "your result summary"
-3. If editing files, first run: hyperclaude lock file1.py file2.py
-4. When done editing, run: hyperclaude unlock
+    # Set protocol if not already set
+    if not get_active_protocol():
+        set_active_protocol(proto)
 
-TASK:
-{task}"""
+    # Get current phase
+    current_phase = get_phase() or "working"
+
+    # Mark worker as working
+    set_worker_state(worker_id, status="working", assignment=task)
+
+    # Minimal preamble - references protocol file instead of explaining everything
+    protocol_path = get_protocol_path(proto)
+    preamble = f"""W{worker_id} | {proto} | {current_phase}
+Task: {task}
+Protocol: {protocol_path}"""
 
     send_to_worker(worker_id, preamble)
-    click.echo(f"Task sent to worker {worker_id}")
+    click.echo(f"Task sent to worker {worker_id} (protocol: {proto})")
 
 
 @main.command()
 @click.argument("task")
-def broadcast(task):
+@click.option("--protocol", "-p", "protocol_name", help="Override active protocol")
+def broadcast(task, protocol_name):
     """Send the same task to ALL workers.
 
-    Example: hyperclaude broadcast "Search for security vulnerabilities"
+    \b
+    Examples:
+        hyperclaude broadcast "Search for security vulnerabilities"
     """
     if not is_swarm_running():
         click.echo("No swarm is currently running.")
@@ -192,97 +292,172 @@ def broadcast(task):
 
     from .launcher import send_to_worker
     from .config import load_config
+    from .protocols import (
+        get_active_protocol, set_worker_state, get_phase,
+        get_protocol_path, set_active_protocol
+    )
 
     config = load_config()
     num_workers = config["default_workers"]
+
+    # Determine protocol
+    proto = protocol_name or get_active_protocol() or "default"
+
+    # Set protocol if not already set
+    if not get_active_protocol():
+        set_active_protocol(proto)
+
+    # Get current phase
+    current_phase = get_phase() or "working"
+    protocol_path = get_protocol_path(proto)
 
     for i in range(num_workers):
-        preamble = f"""You are Worker {i} in a HyperClaude swarm.
+        # Mark worker as working
+        set_worker_state(i, status="working", assignment=task)
 
-PROTOCOL:
-1. Complete the task autonomously
-2. When done, run: hyperclaude report "your result summary"
-3. If editing files, first run: hyperclaude lock file1.py file2.py
-4. When done editing, run: hyperclaude unlock
-
-TASK:
-{task}"""
+        # Minimal preamble
+        preamble = f"""W{i} | {proto} | {current_phase}
+Task: {task}
+Protocol: {protocol_path}"""
         send_to_worker(i, preamble)
 
-    click.echo(f"Task broadcast to {num_workers} workers")
+    click.echo(f"Task broadcast to {num_workers} workers (protocol: {proto})")
 
 
-@main.command()
+@main.command("await")
+@click.argument("trigger", default="all-done")
 @click.option("--timeout", "-t", default=300, help="Max seconds to wait (default: 300)")
-def wait(timeout):
-    """Wait for all workers to be idle (0 tokens).
+def await_trigger(trigger, timeout):
+    """Wait for a trigger (event) to occur.
 
-    Useful after sending tasks to wait for completion.
+    \b
+    Examples:
+        hyperclaude await                  Wait for all-done trigger
+        hyperclaude await all-done         Wait for all workers to finish
+        hyperclaude await worker-0-done    Wait for specific worker
+        hyperclaude await --timeout 60     With custom timeout
     """
-    if not is_swarm_running():
-        click.echo("No swarm is currently running.")
-        return
+    from .protocols import await_trigger as do_await, trigger_exists
 
-    import time
-    from .launcher import get_worker_tokens
-    from .config import load_config
+    click.echo(f"Waiting for trigger: {trigger}")
 
-    config = load_config()
-    num_workers = config["default_workers"]
+    if do_await(trigger, timeout):
+        click.echo(f"Trigger '{trigger}' received.")
+    else:
+        click.echo(f"Timeout waiting for '{trigger}'.")
 
-    click.echo("Waiting for workers to complete...")
-    start_time = time.time()
 
-    while time.time() - start_time < timeout:
-        all_idle = True
-        for i in range(num_workers):
-            tokens = get_worker_tokens(i)
-            if tokens is None or tokens > 0:
-                all_idle = False
-                break
+@main.command()
+@click.argument("worker_id", type=int, required=False)
+def state(worker_id):
+    """View worker state (JSON-based).
 
-        if all_idle:
-            click.echo("All workers idle.")
-            return
+    \b
+    Examples:
+        hyperclaude state       Show all worker states
+        hyperclaude state 0     Show state for worker 0
+    """
+    from .protocols import get_worker_state, get_all_worker_states, get_active_protocol, get_phase
+    import json
 
-        time.sleep(2)
+    # Show protocol/phase header
+    proto = get_active_protocol() or "(none)"
+    current_phase = get_phase() or "(none)"
+    click.echo(f"Protocol: {proto} | Phase: {current_phase}")
+    click.echo("=" * 50)
 
-    click.echo("Timeout waiting for workers.")
+    if worker_id is not None:
+        # Single worker
+        worker_state = get_worker_state(worker_id)
+        click.echo(f"Worker {worker_id}:")
+        click.echo(json.dumps(worker_state, indent=2))
+    else:
+        # All workers
+        all_states = get_all_worker_states()
+        for wid, wstate in all_states.items():
+            status = wstate.get("status", "ready")
+            assignment = wstate.get("assignment", "")
+            branch = wstate.get("branch", "")
+            error = wstate.get("error", "")
+
+            status_str = f"[{status}]"
+            if error:
+                status_str += f" ERROR: {error}"
+            elif branch:
+                status_str += f" branch: {branch}"
+            elif assignment:
+                status_str += f" task: {assignment[:40]}..."
+
+            click.echo(f"  Worker {wid}: {status_str}")
 
 
 # =============================================================================
-# Worker Commands - for workers to report results and manage locks
+# Worker Commands - for workers to signal completion and manage locks
 # =============================================================================
 
 @main.command()
-@click.argument("result")
-@click.option("--worker", "-w", type=int, envvar="HYPERCLAUDE_WORKER_ID", help="Worker ID (auto-detected if set)")
-@click.option("--status", "-s", default="COMPLETE", help="Status: COMPLETE, ERROR, PARTIAL")
-@click.option("--task", "-t", default="", help="Task description")
-def report(result, worker, status, task):
-    """Write a result to the worker's result file.
+@click.option("--worker", "-w", type=int, envvar="HYPERCLAUDE_WORKER_ID", help="Worker ID (auto-detected from env)")
+@click.option("--branch", "-b", help="Branch name (for git-branch protocol)")
+@click.option("--files", "-f", multiple=True, help="Modified files")
+@click.option("--error", "-e", "error_msg", help="Error message if failed")
+@click.option("--result", "-r", help="Result summary")
+def done(worker, branch, files, error_msg, result):
+    """Signal task completion (creates trigger).
 
-    Example: hyperclaude report "Found 5 TODO comments in src/"
+    \b
+    Examples:
+        hyperclaude done                               Signal complete
+        hyperclaude done --branch worker-0-feature     With branch info
+        hyperclaude done --files src/a.py src/b.py     With modified files
+        hyperclaude done --error "Failed to compile"   Signal error
+        hyperclaude done --result "Found 5 issues"     With result summary
     """
+    from .protocols import (
+        set_worker_state, create_trigger, check_all_workers_done,
+        get_worker_id_from_env
+    )
     from .config import get_result_file
 
+    # Auto-detect worker ID
     if worker is None:
-        # Try to detect worker ID from environment or prompt
+        worker = get_worker_id_from_env()
+
+    if worker is None:
         click.echo("Error: Worker ID required. Use --worker N or set HYPERCLAUDE_WORKER_ID")
         return
 
+    # Determine status
+    status = "error" if error_msg else "complete"
+
+    # Update worker state
+    state_update = {"status": status}
+    if branch:
+        state_update["branch"] = branch
+    if files:
+        state_update["files"] = list(files)
+    if error_msg:
+        state_update["error"] = error_msg
+    if result:
+        state_update["result"] = result
+
+    set_worker_state(worker, **state_update)
+
+    # Write result file for backwards compatibility
     result_file = get_result_file(worker)
-
-    content = f"""STATUS: {status}
-TASK: {task or 'Not specified'}
-RESULT:
-{result}
-FILES_MODIFIED:
-(none reported)
+    result_content = f"""STATUS: {status.upper()}
+RESULT: {result or error_msg or 'Task completed'}
+BRANCH: {branch or 'N/A'}
+FILES: {', '.join(files) if files else 'N/A'}
 """
+    result_file.write_text(result_content)
 
-    result_file.write_text(content)
-    click.echo(f"Result written to {result_file}")
+    # Create worker done trigger
+    create_trigger(f"worker-{worker}-done")
+    click.echo(f"Worker {worker} marked as {status}")
+
+    # Check if all workers are done
+    if check_all_workers_done():
+        click.echo("All workers done - 'all-done' trigger created")
 
 
 @main.command()
@@ -291,9 +466,14 @@ FILES_MODIFIED:
 def lock(files, worker):
     """Claim file locks before editing.
 
+    \b
     Example: hyperclaude lock src/main.py src/utils.py
     """
     from .config import get_lock_file, get_hyperclaude_dir
+    from .protocols import get_worker_id_from_env
+
+    if worker is None:
+        worker = get_worker_id_from_env()
 
     if worker is None:
         click.echo("Error: Worker ID required. Use --worker N or set HYPERCLAUDE_WORKER_ID")
@@ -329,9 +509,14 @@ def lock(files, worker):
 def unlock(worker):
     """Release all file locks held by this worker.
 
+    \b
     Example: hyperclaude unlock
     """
     from .config import get_lock_file
+    from .protocols import get_worker_id_from_env
+
+    if worker is None:
+        worker = get_worker_id_from_env()
 
     if worker is None:
         click.echo("Error: Worker ID required. Use --worker N or set HYPERCLAUDE_WORKER_ID")
