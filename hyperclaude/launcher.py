@@ -1,6 +1,7 @@
 """Tmux session management for HyperClaude swarm."""
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -476,67 +477,61 @@ def start_swarm(
     run_tmux(["send-keys", "-t", manager_pane, manager_cmd])
     run_tmux(["send-keys", "-t", manager_pane, "Enter"])
 
-    print("Waiting for Claude instances to initialize...")
-
-    # Wait for all workers to be ready
-    for i in range(num_workers):
-        pane = f"{session}:{window}.{i}"
-        if not wait_for_pane_ready(pane, timeout=30):
-            print(f"  Warning: Worker {i} may not be ready")
-        else:
-            print(f"  Worker {i} ready")
-
-    # Wait for manager to be ready
-    if not wait_for_pane_ready(manager_pane, timeout=30):
-        print("  Warning: Manager may not be ready")
-    else:
-        print("  Manager ready")
-
-    # Clear all workers to start fresh (with delays to ensure delivery)
-    print("Clearing workers...")
-    for i in range(num_workers):
-        pane = f"{session}:{window}.{i}"
-        run_tmux(["send-keys", "-t", pane, "/clear"])
-        time.sleep(0.1)
-        run_tmux(["send-keys", "-t", pane, "Enter"])
-        time.sleep(0.2)  # Small delay between workers
-
-    # Wait for workers to clear
-    time.sleep(2)
-    for i in range(num_workers):
-        pane = f"{session}:{window}.{i}"
-        if wait_for_pane_ready(pane, timeout=10):
-            print(f"  Worker {i} cleared")
-        else:
-            # Retry the clear
-            run_tmux(["send-keys", "-t", pane, "/clear"])
-            time.sleep(0.1)
-            run_tmux(["send-keys", "-t", pane, "Enter"])
-            wait_for_pane_ready(pane, timeout=10)
-
-    # Write worker init file
+    # Write worker init file (do this before waiting so it's ready)
     worker_init_file = get_hyperclaude_dir() / "worker-init.txt"
     worker_init_content = get_worker_init_file_content(num_workers, workspace)
     worker_init_file.write_text(worker_init_content)
 
-    # Send initialization message to all workers
+    print(f"Waiting for {num_workers} workers + manager to initialize...")
+
+    # Parallel wait: check all panes in round-robin until all ready
+    # This is MUCH faster than sequential 30s waits per worker
+    all_panes = [f"{session}:{window}.{i}" for i in range(num_workers)] + [manager_pane]
+    ready_panes = set()
+    max_wait = 60  # Total max wait time (not per-worker)
+    start_time = time.time()
+
+    while len(ready_panes) < len(all_panes) and (time.time() - start_time) < max_wait:
+        for pane in all_panes:
+            if pane in ready_panes:
+                continue
+            result = run_tmux(["capture-pane", "-t", pane, "-p", "-S", "-5"], check=False)
+            if result.returncode == 0:
+                output = result.stdout
+                if re.search(r'^\s*>\s*$', output, re.MULTILINE) or 'tokens' in output:
+                    ready_panes.add(pane)
+                    idx = all_panes.index(pane)
+                    if idx < num_workers:
+                        print(f"  Worker {idx} ready")
+                    else:
+                        print(f"  Manager ready")
+        if len(ready_panes) < len(all_panes):
+            time.sleep(0.5)
+
+    not_ready = len(all_panes) - len(ready_panes)
+    if not_ready > 0:
+        print(f"  Warning: {not_ready} pane(s) may not be ready (continuing anyway)")
+
+    # Send /clear to all workers in quick succession (no per-worker waits)
+    print("Clearing workers...")
+    for i in range(num_workers):
+        pane = f"{session}:{window}.{i}"
+        run_tmux(["send-keys", "-t", pane, "/clear"])
+        run_tmux(["send-keys", "-t", pane, "Enter"])
+
+    # Brief pause for clears to process
+    time.sleep(2)
+
+    # Send init messages to all workers (no per-worker waits)
     print("Initializing workers...")
     for i in range(num_workers):
         pane = f"{session}:{window}.{i}"
         init_msg = get_worker_init_message(i, num_workers, workspace)
         run_tmux(["send-keys", "-t", pane, init_msg])
         run_tmux(["send-keys", "-t", pane, "Enter"])
-        time.sleep(0.1)
 
-    # Wait for workers to process init message
-    print("Waiting for workers to acknowledge...")
-    time.sleep(3)
-    for i in range(num_workers):
-        pane = f"{session}:{window}.{i}"
-        if wait_for_pane_ready(pane, timeout=30):
-            print(f"  Worker {i} initialized")
-        else:
-            print(f"  Warning: Worker {i} may not be ready")
+    # Brief pause then continue (workers will be ready when needed)
+    time.sleep(1)
 
     # Inject manager preamble as first message
     preamble = get_manager_preamble(num_workers, workspace)
