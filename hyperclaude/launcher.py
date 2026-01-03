@@ -490,30 +490,21 @@ def start_swarm(
     # Enable mouse mode for scrolling (instead of up-arrow behavior)
     run_tmux(["set-option", "-t", session, "-g", "mouse", "on"])
 
-    # Calculate grid dimensions for better layout with many workers
-    total_panes = num_workers + 1  # +1 for manager
-    cols = int(math.ceil(math.sqrt(total_panes)))
+    # Create all worker panes sequentially
+    # We start with pane 0 from new-session, need to create num_workers more panes
+    # (num_workers - 1 additional workers + 1 manager)
+    total_panes_to_create = num_workers  # workers 1..N-1 + manager
 
-    # Create panes in a grid pattern for better visibility with many workers
-    # First, create the first row of panes (horizontal splits)
-    for c in range(1, min(cols, num_workers)):
-        run_tmux(["split-window", "-t", f"{session}:{window}", "-h", "-c", str(workspace)])
-    run_tmux(["select-layout", "-t", f"{session}:{window}", "even-horizontal"])
+    for i in range(total_panes_to_create):
+        # Alternate between horizontal and vertical splits for better distribution
+        # This creates a more balanced layout before tiling
+        split_type = "-h" if i % 2 == 0 else "-v"
+        run_tmux(["split-window", "-t", f"{session}:{window}", split_type, "-c", str(workspace)])
 
-    # Then split each column vertically for remaining workers
-    pane_idx = cols
-    while pane_idx < num_workers:
-        # Split from existing panes in the first row
-        target = pane_idx % cols
-        run_tmux(["split-window", "-t", f"{session}:{window}.{target}", "-v", "-c", str(workspace)])
-        pane_idx += 1
-
-    # Apply tiled layout for even distribution
-    run_tmux(["select-layout", "-t", f"{session}:{window}", "tiled"])
-
-    # Create manager pane (last pane)
-    run_tmux(["split-window", "-t", f"{session}:{window}", "-v", "-c", str(workspace)])
-    run_tmux(["select-layout", "-t", f"{session}:{window}", "tiled"])
+        # Apply tiled layout periodically to prevent overly narrow panes
+        # This keeps panes usable during creation and helps tmux manage geometry
+        if (i + 1) % 6 == 0 or i == total_panes_to_create - 1:
+            run_tmux(["select-layout", "-t", f"{session}:{window}", "tiled"])
 
     # Start Claude in each worker pane
     for i in range(num_workers):
