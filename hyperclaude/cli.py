@@ -7,6 +7,7 @@ from pathlib import Path
 from .config import (
     load_config, init_hyperclaude, get_active_session, set_active_session,
     list_sessions as list_sessions_config, get_session_info,
+    validate_session_name, validate_worker_count, validate_lock_paths,
 )
 from .launcher import (
     start_swarm, stop_swarm, get_swarm_status, is_swarm_running,
@@ -56,9 +57,15 @@ def main(ctx, workers, continue_session, model, workspace, session_name):
 
     # Override with CLI options
     num_workers = workers or config["default_workers"]
-    model_name = model or "opus"
+    model_name = model
     target_workspace = Path(workspace) if workspace else Path.cwd()
-    name = session_name or "swarm"
+
+    # Validate inputs
+    try:
+        num_workers = validate_worker_count(num_workers)
+        name = validate_session_name(session_name) if session_name else "swarm"
+    except ValueError as e:
+        raise click.ClickException(str(e))
 
     # Stop existing session if running
     if is_swarm_running(name):
@@ -117,7 +124,7 @@ def status(ctx, session_name):
         click.echo(f"No swarm is currently running{f' for session {session}' if session else ''}.")
         return
 
-    status_info = get_swarm_status()
+    status_info = get_swarm_status(session)
 
     click.echo(f"hyperclaude Swarm Status{f' ({session})' if session else ''}")
     click.echo("=" * 40)
@@ -192,7 +199,7 @@ def reset(ctx, session_name):
     from .config import get_session_results_dir
 
     click.echo("Full reset: clearing workers, state, and results...")
-    clear_all_workers()
+    clear_all_workers(session)
     reset_swarm_state(session)
 
     # Also clear result files
@@ -344,7 +351,7 @@ def _build_worker_preamble(worker_id: int, protocol: str, phase: str, task: str)
 @click.argument("message")
 @click.option("--protocol", "-p", "protocol_name", help="Override active protocol")
 @click.option("--wait", "-w", is_flag=True, help="Block until worker signals completion")
-@click.option("--timeout", "-t", default=300, help="Timeout in seconds when using --wait (default: 300)")
+@click.option("--timeout", "-t", type=click.IntRange(1, 3600), default=300, help="Timeout in seconds (1-3600, default: 300)")
 @click.option("--name", "-n", "session_name", type=str, help="Session name")
 @click.pass_context
 def send(ctx, target, message, protocol_name, wait, timeout, session_name):
@@ -413,8 +420,8 @@ def send(ctx, target, message, protocol_name, wait, timeout, session_name):
     # Clear any stale trigger for this worker before sending
     clear_trigger(f"worker-{worker_id}-done", session)
 
-    # Mark worker as working
-    set_worker_state(worker_id, session, status="working", assignment=message)
+    # Mark worker as working (reset state for new task)
+    set_worker_state(worker_id, session, reset=True, status="working", assignment=message)
 
     # Build worker preamble with clear instructions
     preamble = _build_worker_preamble(worker_id, proto, current_phase, message)
@@ -446,7 +453,7 @@ def send(ctx, target, message, protocol_name, wait, timeout, session_name):
 @click.argument("task")
 @click.option("--protocol", "-p", "protocol_name", help="Override active protocol")
 @click.option("--wait", "-w", is_flag=True, help="Block until all workers signal completion")
-@click.option("--timeout", "-t", default=300, help="Timeout in seconds when using --wait (default: 300)")
+@click.option("--timeout", "-t", type=click.IntRange(1, 3600), default=300, help="Timeout in seconds (1-3600, default: 300)")
 @click.option("--name", "-n", "session_name", type=str, help="Session name")
 @click.pass_context
 def broadcast(ctx, task, protocol_name, wait, timeout, session_name):
@@ -495,13 +502,20 @@ def broadcast(ctx, task, protocol_name, wait, timeout, session_name):
     # Clear any stale triggers before sending
     clear_all_triggers(session)
 
+    # Stagger sends to avoid overwhelming tmux with many workers
+    # 50ms delay between workers = 1.25s total for 25 workers
+    import time
     for i in range(num_workers):
-        # Mark worker as working
-        set_worker_state(i, session, status="working", assignment=task)
+        # Mark worker as working (reset state for new task)
+        set_worker_state(i, session, reset=True, status="working", assignment=task)
 
         # Build worker preamble with clear instructions
         preamble = _build_worker_preamble(i, proto, current_phase, task)
         send_to_worker(i, preamble, session)
+
+        # Small delay between workers to prevent tmux command pile-up
+        if i < num_workers - 1:
+            time.sleep(0.05)
 
     click.echo(f"Task broadcast to {num_workers} workers (protocol: {proto})")
 
@@ -543,7 +557,7 @@ def broadcast(ctx, task, protocol_name, wait, timeout, session_name):
 
 @main.command("await")
 @click.argument("trigger", default="all-done")
-@click.option("--timeout", "-t", default=300, help="Max seconds to wait (default: 300)")
+@click.option("--timeout", "-t", type=click.IntRange(1, 3600), default=300, help="Max seconds to wait (1-3600, default: 300)")
 @click.option("--name", "-n", "session_name", type=str, help="Session name")
 @click.pass_context
 def await_cmd(ctx, trigger, timeout, session_name):
@@ -672,18 +686,21 @@ def done(ctx, worker, branch, files, error_msg, result, session_name):
 
     set_worker_state(worker, session, **state_update)
 
-    # Write result file for backwards compatibility
+    # Write result file atomically (write to .tmp, then rename)
+    # This ensures the file is complete before trigger is created
     results_dir = get_session_results_dir(session)
     results_dir.mkdir(parents=True, exist_ok=True)
     result_file = results_dir / f"worker-{worker}.txt"
+    result_file_tmp = results_dir / f"worker-{worker}.txt.tmp"
     result_content = f"""STATUS: {done_status.upper()}
 RESULT: {result or error_msg or 'Task completed'}
 BRANCH: {branch or 'N/A'}
 FILES: {', '.join(files) if files else 'N/A'}
 """
-    result_file.write_text(result_content)
+    result_file_tmp.write_text(result_content)
+    result_file_tmp.rename(result_file)  # Atomic on POSIX
 
-    # Create worker done trigger
+    # Create worker done trigger (after result file is ready)
     create_trigger(f"worker-{worker}-done", session)
     click.echo(f"Worker {worker} marked as {done_status}")
 
@@ -703,8 +720,7 @@ def lock(ctx, files, worker, session_name):
     \b
     Example: hyperclaude lock src/main.py src/utils.py
     """
-    from .config import get_session_locks_dir
-    from .protocols import get_worker_id_from_env
+    from .protocols import get_worker_id_from_env, acquire_file_locks
 
     session = session_name or ctx.obj.get("session") or get_active_session()
 
@@ -715,29 +731,22 @@ def lock(ctx, files, worker, session_name):
         click.echo("Error: Worker ID required. Use --worker N or set HYPERCLAUDE_WORKER_ID")
         return
 
-    # Check for conflicts with other workers' locks
-    locks_dir = get_session_locks_dir(session)
-    locks_dir.mkdir(parents=True, exist_ok=True)
+    # Validate file paths
+    try:
+        validated_files = validate_lock_paths(files)
+    except ValueError as e:
+        raise click.ClickException(str(e))
 
-    conflicts = []
-    for lock_file in locks_dir.glob("*.lock"):
-        if lock_file.name == f"worker-{worker}.lock":
-            continue
-        locked_files = lock_file.read_text().strip().split("\n")
-        for f in files:
-            if f in locked_files:
-                conflicts.append((lock_file.stem, f))
+    # Atomically acquire locks
+    success, conflicts = acquire_file_locks(worker, validated_files, session)
 
-    if conflicts:
+    if not success:
         click.echo("CONFLICT: Files locked by other workers:")
         for owner, file in conflicts:
             click.echo(f"  {file} -> {owner}")
         return
 
-    # Create lock file
-    lock_file = locks_dir / f"worker-{worker}.lock"
-    lock_file.write_text("\n".join(files))
-    click.echo(f"Locked {len(files)} file(s)")
+    click.echo(f"Locked {len(validated_files)} file(s)")
 
 
 @main.command()
@@ -750,8 +759,7 @@ def unlock(ctx, worker, session_name):
     \b
     Example: hyperclaude unlock
     """
-    from .config import get_session_locks_dir
-    from .protocols import get_worker_id_from_env
+    from .protocols import get_worker_id_from_env, release_file_locks
 
     session = session_name or ctx.obj.get("session") or get_active_session()
 
@@ -762,9 +770,7 @@ def unlock(ctx, worker, session_name):
         click.echo("Error: Worker ID required. Use --worker N or set HYPERCLAUDE_WORKER_ID")
         return
 
-    lock_file = get_session_locks_dir(session) / f"worker-{worker}.lock"
-    if lock_file.exists():
-        lock_file.unlink()
+    if release_file_locks(worker, session):
         click.echo("Locks released")
     else:
         click.echo("No locks held")
@@ -775,26 +781,21 @@ def unlock(ctx, worker, session_name):
 @click.pass_context
 def locks(ctx, session_name):
     """Show all active file locks."""
-    from .config import get_session_locks_dir
+    from .protocols import get_all_locks
 
     session = session_name or ctx.obj.get("session") or get_active_session()
-    locks_dir = get_session_locks_dir(session)
+    all_locks = get_all_locks(session)
 
-    if not locks_dir.exists():
-        click.echo("No locks directory")
-        return
-
-    lock_files = list(locks_dir.glob("*.lock"))
-    if not lock_files:
+    if not all_locks:
         click.echo("No active locks")
         return
 
     click.echo("Active File Locks")
     click.echo("=" * 40)
-    for lock_file in lock_files:
-        click.echo(f"\n{lock_file.stem}:")
-        for line in lock_file.read_text().strip().split("\n"):
-            click.echo(f"  {line}")
+    for worker, files in all_locks.items():
+        click.echo(f"\n{worker}:")
+        for f in files:
+            click.echo(f"  {f}")
 
 
 # =============================================================================

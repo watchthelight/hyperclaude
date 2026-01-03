@@ -1,5 +1,6 @@
 """Tmux session management for HyperClaude swarm."""
 
+import math
 import os
 import re
 import shutil
@@ -13,6 +14,7 @@ from .config import (
     load_config, get_hyperclaude_dir, init_hyperclaude, configure_claude_permissions,
     register_session, unregister_session, get_session_info, get_active_session,
     get_default_session_name, set_active_session, list_sessions,
+    validate_message_length,
 )
 
 
@@ -79,6 +81,37 @@ def run_tmux(args: list[str], check: bool = True) -> subprocess.CompletedProcess
     """Run a tmux command."""
     cmd = ["tmux"] + args
     return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+
+def batch_send_keys(
+    session: str,
+    window: str,
+    pane_messages: list[tuple[int, str]],
+    send_enter: bool = True
+) -> None:
+    """Send messages to multiple panes efficiently via tmux script.
+
+    This is much faster than individual send-keys calls for many panes.
+    """
+    if not pane_messages:
+        return
+
+    script_file = get_hyperclaude_dir() / "batch_commands.tmux"
+    commands = []
+
+    for pane, message in pane_messages:
+        # Escape single quotes for tmux
+        escaped = message.replace("'", "'\\''")
+        commands.append(f"send-keys -t {session}:{window}.{pane} '{escaped}'")
+        if send_enter:
+            commands.append(f"send-keys -t {session}:{window}.{pane} Enter")
+
+    script_file.write_text("\n".join(commands))
+    try:
+        run_tmux(["source-file", str(script_file)], check=False)
+    finally:
+        if script_file.exists():
+            script_file.unlink()
 
 
 def wait_for_pane_ready(pane: str, timeout: int = 30) -> bool:
@@ -176,6 +209,7 @@ def get_manager_pane_target(session_name: Optional[str] = None) -> str:
 
 def send_to_worker(worker_id: int, message: str, session_name: Optional[str] = None) -> None:
     """Send a message to a worker pane."""
+    validate_message_length(message)
     target = get_pane_target(worker_id, session_name)
     # Send text - for multi-line, Claude CLI enters "paste mode"
     run_tmux(["send-keys", "-t", target, message])
@@ -190,6 +224,7 @@ def send_to_worker(worker_id: int, message: str, session_name: Optional[str] = N
 
 def send_to_manager(message: str, session_name: Optional[str] = None) -> None:
     """Send a message to the manager pane."""
+    validate_message_length(message)
     target = get_manager_pane_target(session_name)
     # Send text - for multi-line, Claude CLI enters "paste mode"
     run_tmux(["send-keys", "-t", target, message])
@@ -202,16 +237,16 @@ def send_to_manager(message: str, session_name: Optional[str] = None) -> None:
     run_tmux(["send-keys", "-t", target, "Enter"])
 
 
-def capture_pane(worker_id: int, lines: int = 50) -> str:
+def capture_pane(worker_id: int, lines: int = 50, session_name: Optional[str] = None) -> str:
     """Capture output from a worker pane."""
-    target = get_pane_target(worker_id)
+    target = get_pane_target(worker_id, session_name)
     result = run_tmux(["capture-pane", "-t", target, "-p", "-S", f"-{lines}"])
     return result.stdout
 
 
-def get_worker_tokens(worker_id: int) -> Optional[int]:
+def get_worker_tokens(worker_id: int, session_name: Optional[str] = None) -> Optional[int]:
     """Get the token count for a worker from its pane output."""
-    output = capture_pane(worker_id, lines=10)
+    output = capture_pane(worker_id, lines=10, session_name=session_name)
     # Look for pattern like "12345 tokens"
     import re
     match = re.search(r"(\d+)\s+tokens", output)
@@ -242,31 +277,43 @@ def is_worker_idle(worker_id: int) -> bool:
     return False
 
 
-def clear_worker(worker_id: int) -> None:
+def clear_worker(worker_id: int, session_name: Optional[str] = None) -> None:
     """Clear a worker's context."""
-    send_to_worker(worker_id, "/clear")
+    send_to_worker(worker_id, "/clear", session_name)
 
 
-def clear_all_workers() -> None:
+def clear_all_workers(session_name: Optional[str] = None) -> None:
     """Clear all workers' contexts."""
-    config = load_config()
-    num_workers = config["default_workers"]
+    session = session_name or get_active_session()
+    session_info = get_session_info(session) if session else None
+
+    if session_info:
+        num_workers = session_info.get("num_workers", 6)
+    else:
+        config = load_config()
+        num_workers = config["default_workers"]
 
     for i in range(num_workers):
-        clear_worker(i)
+        clear_worker(i, session_name)
         time.sleep(0.1)  # Small delay between clears
 
 
-def get_swarm_status() -> dict:
+def get_swarm_status(session_name: Optional[str] = None) -> dict:
     """Get status information for all workers."""
     from .config import get_worker_state
 
-    config = load_config()
-    num_workers = config["default_workers"]
+    session = session_name or get_active_session()
+    session_info = get_session_info(session) if session else None
+
+    if session_info:
+        num_workers = session_info.get("num_workers", 6)
+    else:
+        config = load_config()
+        num_workers = config["default_workers"]
 
     status = {}
     for i in range(num_workers):
-        tokens = get_worker_tokens(i)
+        tokens = get_worker_tokens(i, session_name)
         worker_state = get_worker_state(i)
 
         # Use explicit state from state file
@@ -443,29 +490,40 @@ def start_swarm(
     # Enable mouse mode for scrolling (instead of up-arrow behavior)
     run_tmux(["set-option", "-t", session, "-g", "mouse", "on"])
 
-    # Start Claude in pane 0 with HYPERCLAUDE_WORKER_ID and system prompt
-    run_tmux(["send-keys", "-t", f"{session}:{window}", "export HYPERCLAUDE_WORKER_ID=0"])
-    run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
-    worker_prompt = get_worker_system_prompt(0).replace('"', '\\"').replace('\n', '\\n')
-    run_tmux(["send-keys", "-t", f"{session}:{window}",
-              f'claude --dangerously-skip-permissions --append-system-prompt "{worker_prompt}"'])
-    run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
+    # Calculate grid dimensions for better layout with many workers
+    total_panes = num_workers + 1  # +1 for manager
+    cols = int(math.ceil(math.sqrt(total_panes)))
 
-    # Create remaining worker panes (1 to num_workers-1)
-    for i in range(1, num_workers):
+    # Create panes in a grid pattern for better visibility with many workers
+    # First, create the first row of panes (horizontal splits)
+    for c in range(1, min(cols, num_workers)):
         run_tmux(["split-window", "-t", f"{session}:{window}", "-h", "-c", str(workspace)])
-        # Set worker ID environment variable
-        run_tmux(["send-keys", "-t", f"{session}:{window}", f"export HYPERCLAUDE_WORKER_ID={i}"])
-        run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
-        worker_prompt = get_worker_system_prompt(i).replace('"', '\\"').replace('\n', '\\n')
-        run_tmux(["send-keys", "-t", f"{session}:{window}",
-                  f'claude --dangerously-skip-permissions --append-system-prompt "{worker_prompt}"'])
-        run_tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
-        run_tmux(["select-layout", "-t", f"{session}:{window}", "tiled"])
+    run_tmux(["select-layout", "-t", f"{session}:{window}", "even-horizontal"])
+
+    # Then split each column vertically for remaining workers
+    pane_idx = cols
+    while pane_idx < num_workers:
+        # Split from existing panes in the first row
+        target = pane_idx % cols
+        run_tmux(["split-window", "-t", f"{session}:{window}.{target}", "-v", "-c", str(workspace)])
+        pane_idx += 1
+
+    # Apply tiled layout for even distribution
+    run_tmux(["select-layout", "-t", f"{session}:{window}", "tiled"])
 
     # Create manager pane (last pane)
     run_tmux(["split-window", "-t", f"{session}:{window}", "-v", "-c", str(workspace)])
     run_tmux(["select-layout", "-t", f"{session}:{window}", "tiled"])
+
+    # Start Claude in each worker pane
+    for i in range(num_workers):
+        pane = f"{session}:{window}.{i}"
+        run_tmux(["send-keys", "-t", pane, f"export HYPERCLAUDE_WORKER_ID={i}"])
+        run_tmux(["send-keys", "-t", pane, "Enter"])
+        worker_prompt = get_worker_system_prompt(i).replace('"', '\\"').replace('\n', '\\n')
+        run_tmux(["send-keys", "-t", pane,
+                  f'claude --dangerously-skip-permissions --append-system-prompt "{worker_prompt}"'])
+        run_tmux(["send-keys", "-t", pane, "Enter"])
 
     # Build manager command (no bypass - manager uses normal permissions)
     manager_cmd = "claude"
@@ -488,7 +546,8 @@ def start_swarm(
     # This is MUCH faster than sequential 30s waits per worker
     all_panes = [f"{session}:{window}.{i}" for i in range(num_workers)] + [manager_pane]
     ready_panes = set()
-    max_wait = 60  # Total max wait time (not per-worker)
+    # Dynamic timeout: 3 seconds per worker, minimum 60 seconds
+    max_wait = max(60, num_workers * 3)
     start_time = time.time()
 
     while len(ready_panes) < len(all_panes) and (time.time() - start_time) < max_wait:
@@ -512,23 +571,21 @@ def start_swarm(
     if not_ready > 0:
         print(f"  Warning: {not_ready} pane(s) may not be ready (continuing anyway)")
 
-    # Send /clear to all workers in quick succession (no per-worker waits)
+    # Clear all workers using batched commands (much faster for many workers)
     print("Clearing workers...")
-    for i in range(num_workers):
-        pane = f"{session}:{window}.{i}"
-        run_tmux(["send-keys", "-t", pane, "/clear"])
-        run_tmux(["send-keys", "-t", pane, "Enter"])
+    clear_messages = [(i, "/clear") for i in range(num_workers)]
+    batch_send_keys(session, window, clear_messages)
 
     # Brief pause for clears to process
     time.sleep(2)
 
-    # Send init messages to all workers (no per-worker waits)
+    # Initialize all workers using batched commands
     print("Initializing workers...")
-    for i in range(num_workers):
-        pane = f"{session}:{window}.{i}"
-        init_msg = get_worker_init_message(i, num_workers, workspace)
-        run_tmux(["send-keys", "-t", pane, init_msg])
-        run_tmux(["send-keys", "-t", pane, "Enter"])
+    init_messages = [
+        (i, get_worker_init_message(i, num_workers, workspace))
+        for i in range(num_workers)
+    ]
+    batch_send_keys(session, window, init_messages)
 
     # Brief pause then continue (workers will be ready when needed)
     time.sleep(1)

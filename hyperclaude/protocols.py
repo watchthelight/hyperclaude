@@ -1,9 +1,11 @@
 """Protocol and state management for hyperclaude swarm."""
 
+import fcntl
 import json
 import os
 import shutil
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -17,6 +19,7 @@ from .config import (
     get_session_state_dir,
     get_session_triggers_dir,
     get_session_worker_state_dir,
+    get_session_locks_dir,
     get_active_session,
     get_session_info,
     ensure_session_directories,
@@ -137,12 +140,25 @@ def get_worker_state(worker_id: int, session: Optional[str] = None) -> dict[str,
     return {"status": "ready"}
 
 
-def set_worker_state(worker_id: int, session: Optional[str] = None, **kwargs) -> None:
-    """Set worker state. Starts fresh to avoid stale data from previous tasks."""
+def set_worker_state(worker_id: int, session: Optional[str] = None, reset: bool = False, **kwargs) -> None:
+    """Set worker state.
+
+    Args:
+        worker_id: Worker ID
+        session: Session name
+        reset: If True, start fresh (for new tasks). If False, merge with existing.
+        **kwargs: State fields to set
+    """
     session = session or get_active_session() or "swarm"
     ensure_session_directories(session)
-    # Start fresh instead of merging - prevents stale branch/files from persisting
-    new_state = {"status": "ready"}
+
+    if reset:
+        # Start fresh for new task assignment
+        new_state = {"status": "ready"}
+    else:
+        # Merge with existing state to preserve fields
+        new_state = get_worker_state(worker_id, session)
+
     new_state.update(kwargs)
     path = get_worker_state_path(worker_id, session)
     path.write_text(json.dumps(new_state, indent=2))
@@ -170,7 +186,11 @@ def clear_worker_states(session: Optional[str] = None) -> None:
     state_dir = get_session_worker_state_dir(session)
     if state_dir.exists():
         for f in state_dir.glob("*.json"):
-            f.unlink()
+            try:
+                f.unlink(missing_ok=True)
+            except (IOError, OSError):
+                # File may have been deleted or locked by another process
+                pass
 
 
 # =============================================================================
@@ -194,8 +214,11 @@ def trigger_exists(name: str, session: Optional[str] = None) -> bool:
 def clear_trigger(name: str, session: Optional[str] = None) -> None:
     """Remove a trigger file."""
     trigger_file = get_session_triggers_dir(session) / name
-    if trigger_file.exists():
-        trigger_file.unlink()
+    try:
+        trigger_file.unlink(missing_ok=True)
+    except (IOError, OSError):
+        # File may have been deleted by another process
+        pass
 
 
 def await_trigger(name: str, timeout: int = 300, session: Optional[str] = None) -> bool:
@@ -217,7 +240,11 @@ def clear_all_triggers(session: Optional[str] = None) -> None:
     if triggers_dir.exists():
         for f in triggers_dir.iterdir():
             if f.is_file():
-                f.unlink()
+                try:
+                    f.unlink(missing_ok=True)
+                except (IOError, OSError):
+                    # File may have been deleted by another process
+                    pass
 
 
 def check_all_workers_done(session: Optional[str] = None) -> bool:
@@ -241,6 +268,133 @@ def check_all_workers_done(session: Optional[str] = None) -> bool:
         create_trigger("all-done", session)
 
     return all_done
+
+
+# =============================================================================
+# Session-Level Locking
+# =============================================================================
+
+
+@contextmanager
+def session_lock(session: Optional[str] = None):
+    """Context manager for session-level exclusive operations.
+
+    Use this to protect critical sections that modify session state.
+
+    Example:
+        with session_lock(session):
+            # Critical section - only one process at a time
+            modify_session_state()
+    """
+    session = session or get_active_session() or "swarm"
+    ensure_session_directories(session)
+
+    from .config import get_session_dir
+    lock_file_path = get_session_dir(session) / ".session.lock"
+
+    lock_file = open(lock_file_path, 'w')
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+
+
+# =============================================================================
+# Atomic File Locking
+# =============================================================================
+
+def acquire_file_locks(
+    worker_id: int,
+    files: list[str],
+    session: Optional[str] = None
+) -> tuple[bool, list[tuple[str, str]]]:
+    """Atomically acquire file locks.
+
+    Uses a master lock file with fcntl to ensure atomic check-and-lock.
+
+    Args:
+        worker_id: Worker ID requesting locks
+        files: List of file paths to lock
+        session: Session name
+
+    Returns:
+        (success, conflicts) where conflicts is list of (owner, file) tuples
+    """
+    session = session or get_active_session() or "swarm"
+    locks_dir = get_session_locks_dir(session)
+    locks_dir.mkdir(parents=True, exist_ok=True)
+
+    master_lock_path = locks_dir / ".master.lock"
+
+    # Open/create master lock file
+    with open(master_lock_path, 'w') as master_lock:
+        # Acquire exclusive lock on master file
+        fcntl.flock(master_lock, fcntl.LOCK_EX)
+        try:
+            # Check for conflicts while holding master lock
+            conflicts = []
+            for lock_file in locks_dir.glob("worker-*.lock"):
+                if lock_file.stem == f"worker-{worker_id}":
+                    continue
+                try:
+                    locked_files = set(lock_file.read_text().strip().split("\n"))
+                    for f in files:
+                        if f in locked_files:
+                            conflicts.append((lock_file.stem, f))
+                except (IOError, OSError):
+                    # Lock file may have been deleted concurrently
+                    continue
+
+            if conflicts:
+                return False, conflicts
+
+            # Write our lock file while still holding master lock
+            my_lock = locks_dir / f"worker-{worker_id}.lock"
+            my_lock.write_text("\n".join(files))
+            return True, []
+
+        finally:
+            # Release master lock
+            fcntl.flock(master_lock, fcntl.LOCK_UN)
+
+
+def release_file_locks(worker_id: int, session: Optional[str] = None) -> bool:
+    """Release all file locks held by a worker.
+
+    Returns True if locks were released, False if no locks held.
+    """
+    session = session or get_active_session() or "swarm"
+    locks_dir = get_session_locks_dir(session)
+    lock_file = locks_dir / f"worker-{worker_id}.lock"
+
+    if lock_file.exists():
+        try:
+            lock_file.unlink()
+            return True
+        except (IOError, OSError):
+            return False
+    return False
+
+
+def get_all_locks(session: Optional[str] = None) -> dict[str, list[str]]:
+    """Get all active file locks.
+
+    Returns dict mapping worker name to list of locked files.
+    """
+    session = session or get_active_session() or "swarm"
+    locks_dir = get_session_locks_dir(session)
+
+    locks = {}
+    if locks_dir.exists():
+        for lock_file in locks_dir.glob("worker-*.lock"):
+            try:
+                files = lock_file.read_text().strip().split("\n")
+                locks[lock_file.stem] = files
+            except (IOError, OSError):
+                continue
+    return locks
 
 
 # =============================================================================

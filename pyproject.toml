@@ -28,4 +28,4 @@ dev = [
 where = ["."]
 
 [tool.setuptools.package-data]
-hyperclaude = ["templates/*.md"]
+hyperclaude = ["templates/**/*.md"]

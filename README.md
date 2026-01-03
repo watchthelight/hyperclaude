@@ -18,7 +18,7 @@ After installation, run `hyperclaude setup` to configure Claude Code permissions
 
 ## What is hyperclaude?
 
-hyperclaude creates a tmux-based swarm of Claude Code instances: one **manager** that coordinates work, and multiple **workers** that execute tasks in parallel.
+hyperclaude creates a tmux-based swarm of Claude Code instances: one **manager** that coordinates work, and multiple **workers** that execute tasks in parallel. Supports up to 50 workers with optimized grid layouts.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -42,17 +42,27 @@ hyperclaude creates a tmux-based swarm of Claude Code instances: one **manager**
 ## Usage
 
 ```bash
-# Start swarm in current directory
+# Start swarm in current directory (default: 6 workers, Opus model)
 hyperclaude
 
-# Start with custom worker count
-hyperclaude --workers 4
+# Start with custom worker count (up to 50)
+hyperclaude --workers 25
+
+# Use different models
+hyperclaude --sonnet           # Use Sonnet
+hyperclaude --haiku            # Use Haiku
 
 # Start in a specific directory
 hyperclaude -d /path/to/project
 
+# Multi-session support (run multiple independent swarms)
+hyperclaude --name frontend    # Start named session
+hyperclaude --name backend     # Start another session
+hyperclaude sessions           # List all sessions
+
 # Stop the swarm
 hyperclaude stop
+hyperclaude stop --name frontend  # Stop specific session
 ```
 
 A Terminal window will open with the swarm. The manager (bottom pane) is ready to receive your instructions.
@@ -68,12 +78,45 @@ hyperclaude uses a token-efficient protocol system. Workers read protocol docs f
 
 Set protocol: `hyperclaude protocol git-branch`
 
+## Manager Commands
+
+The manager uses these commands to coordinate workers:
+
+```bash
+hyperclaude send 0 "task"         # Send task to worker 0
+hyperclaude broadcast "task"      # Send task to ALL workers
+hyperclaude await all-done        # Wait for all workers to complete
+hyperclaude state                 # View worker states
+hyperclaude results               # View worker results
+hyperclaude clear                 # Reset state for next batch
+```
+
+## Worker Commands
+
+Workers signal completion and manage file locks:
+
+```bash
+hyperclaude done --result "summary"   # Signal task complete
+hyperclaude done --error "message"    # Signal error
+hyperclaude lock path/to/file.py      # Claim file lock (atomic)
+hyperclaude unlock                    # Release locks
+```
+
 ## How It Works
 
 1. You give the manager a task
 2. Manager sets a protocol and delegates subtasks to workers
 3. Workers execute in parallel and signal completion with `hyperclaude done`
 4. Manager waits with `hyperclaude await all-done` and aggregates results
+
+## Features
+
+- **Scalable**: Supports up to 50 workers with optimized grid layouts
+- **Multi-session**: Run multiple independent swarms simultaneously
+- **Atomic file locking**: Prevents worker conflicts with fcntl-based locks
+- **Dynamic timeouts**: Automatically adjusts for worker count
+- **Input validation**: Session names, paths, and message sizes validated
+- **Session-aware**: All commands respect the active session context
 
 ## License
 

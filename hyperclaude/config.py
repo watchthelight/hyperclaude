@@ -2,10 +2,65 @@
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+MAX_WORKERS = 50
+MAX_MESSAGE_LENGTH = 100_000  # 100KB
+VALID_SESSION_NAME = re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
+
+
+# =============================================================================
+# Validation Functions
+# =============================================================================
+
+def validate_session_name(name: str) -> str:
+    """Validate session name. Raises ValueError if invalid."""
+    if not VALID_SESSION_NAME.match(name):
+        raise ValueError(
+            f"Invalid session name '{name}'. "
+            "Use only letters, numbers, hyphens, underscores (max 64 chars)."
+        )
+    return name
+
+
+def validate_worker_count(count: int) -> int:
+    """Validate worker count. Raises ValueError if invalid."""
+    if count < 1:
+        raise ValueError("Worker count must be at least 1")
+    if count > MAX_WORKERS:
+        raise ValueError(f"Maximum {MAX_WORKERS} workers supported")
+    return count
+
+
+def validate_message_length(message: str) -> str:
+    """Validate message length. Raises ValueError if too long."""
+    if len(message) > MAX_MESSAGE_LENGTH:
+        raise ValueError(
+            f"Message too long ({len(message)} bytes, max {MAX_MESSAGE_LENGTH})"
+        )
+    return message
+
+
+def validate_lock_paths(files: tuple[str, ...] | list[str]) -> list[str]:
+    """Validate file paths for locking. Raises ValueError if invalid."""
+    validated = []
+    for f in files:
+        if '\n' in f or '\0' in f:
+            raise ValueError(f"Invalid characters in path: {f}")
+        if '..' in f.split('/'):
+            raise ValueError(f"Path traversal not allowed: {f}")
+        validated.append(f)
+    return validated
+
 
 # Default configuration
 DEFAULT_CONFIG = {
