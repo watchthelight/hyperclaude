@@ -484,11 +484,16 @@ def start_swarm(
         "-s", session,
         "-n", window,
         "-c", str(workspace),
-        "-x", "200", "-y", "50",
+        "-x", "400", "-y", "200",
     ])
 
     # Enable mouse mode for scrolling (instead of up-arrow behavior)
     run_tmux(["set-option", "-t", session, "-g", "mouse", "on"])
+
+    # Allow very small panes to support many workers
+    run_tmux(["set-option", "-t", session, "pane-base-index", "0"])
+    run_tmux(["set-window-option", "-t", f"{session}:{window}", "main-pane-width", "1"])
+    run_tmux(["set-window-option", "-t", f"{session}:{window}", "main-pane-height", "1"])
 
     # Create all worker panes sequentially
     # We start with pane 0 from new-session, need to create num_workers more panes
@@ -496,15 +501,13 @@ def start_swarm(
     total_panes_to_create = num_workers  # workers 1..N-1 + manager
 
     for i in range(total_panes_to_create):
-        # Alternate between horizontal and vertical splits for better distribution
-        # This creates a more balanced layout before tiling
-        split_type = "-h" if i % 2 == 0 else "-v"
-        run_tmux(["split-window", "-t", f"{session}:{window}", split_type, "-c", str(workspace)])
+        # Apply tiled layout BEFORE each split to ensure there's room
+        run_tmux(["select-layout", "-t", f"{session}:{window}", "tiled"])
+        # Split from the current pane
+        run_tmux(["split-window", "-t", f"{session}:{window}", "-h", "-c", str(workspace)])
 
-        # Apply tiled layout periodically to prevent overly narrow panes
-        # This keeps panes usable during creation and helps tmux manage geometry
-        if (i + 1) % 6 == 0 or i == total_panes_to_create - 1:
-            run_tmux(["select-layout", "-t", f"{session}:{window}", "tiled"])
+    # Final tiled layout for even distribution
+    run_tmux(["select-layout", "-t", f"{session}:{window}", "tiled"])
 
     # Start Claude in each worker pane
     for i in range(num_workers):
